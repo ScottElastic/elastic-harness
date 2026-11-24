@@ -1,0 +1,5 @@
+id,risk,owner,severity,status
+R1,Signed firmware not delivered by 2026-11-27,Sofia Lindqvist,high,open
+R2,Dock 7 reader housing delayed past 2026-11-30,Dev Patel,medium,open
+R3,Night shift cover not arranged for cutover,Priya Nair,medium,open
+R4,Legacy integration cannot be re-enabled after switch-off,Marcus Oyelaran,high,accepted

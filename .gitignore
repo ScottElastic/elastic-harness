@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
+.DS_Store
+
+# credentials never belong in the repo
+creds.local.json
+*.local.json
+.env
+.env.*
+env.sh
+config.json
+*.pem
+*.key
