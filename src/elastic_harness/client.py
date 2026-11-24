@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+import uuid
 from typing import Iterable, Iterator
 
 from .config import Profile
@@ -114,6 +115,41 @@ class Elastic:
     def whoami(self) -> dict:
         return self.es("GET", "/_security/_authenticate")
 
+    # -- spaces, alerts, cases ---------------------------------------------------------------
+    def spaces(self) -> list[dict]:
+        """Spaces this key can see. Not space-scoped, so no /s/ prefix."""
+        return self._json("GET", f"{self.kibana_url}/api/spaces/space")
+
+    def alert(self, alert_id: str) -> dict | None:
+        res = self.kb("POST", "/api/detection_engine/signals/search",
+                      {"query": {"ids": {"values": [alert_id]}}, "size": 1})
+        hits = (res.get("hits") or {}).get("hits") or []
+        return hits[0] if hits else None
+
+    def case(self, case_id: str) -> dict:
+        return self.kb("GET", f"/api/cases/{case_id}")
+
+    def case_comments(self, case_id: str) -> list[dict]:
+        return self.kb("GET", f"/api/cases/{case_id}/comments/_find?perPage=20").get("comments", [])
+
+    def case_alerts(self, case_id: str) -> list[dict]:
+        res = self.kb("GET", f"/api/cases/{case_id}/alerts")
+        return res if isinstance(res, list) else []
+
+    def abort_execution(self, execution_id: str, wait: bool = True, timeout: int = 15) -> bool:
+        """Stop a running agent execution. Dropping the SSE connection does NOT stop it (verified 9.6.0).
+
+        Internal Kibana API (no stability promise): returns False instead of raising if it is unavailable.
+        """
+        url = self.kb_url(f"/internal/agent_builder/executions/{execution_id}/abort?wait_for_terminal={str(wait).lower()}")
+        h = self._headers(True, {"Elastic-Api-Version": "1", "x-elastic-internal-origin": "kibana"})
+        try:
+            req = urllib.request.Request(url, data=b"", headers=h, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return bool(json.loads(r.read().decode() or "{}").get("acknowledged"))
+        except (urllib.error.URLError, ValueError, OSError):
+            return False
+
     # -- Agent Builder ----------------------------------------------------------------------
     def agents(self) -> list[dict]:
         return self.kb("GET", "/api/agent_builder/agents").get("results", [])
@@ -138,7 +174,7 @@ class Elastic:
 
     def converse_body(self, agent_id: str, text: str, conversation_id: str | None = None,
                       model: str | None = None, overrides: dict | None = None,
-                      prompts: dict | None = None) -> dict:
+                      prompts: dict | None = None, execution_id: str | None = None) -> dict:
         body: dict = {"agent_id": agent_id}
         if text:
             body["input"] = text
@@ -150,10 +186,17 @@ class Elastic:
             body["configuration_overrides"] = overrides
         if prompts:
             body["prompts"] = prompts
+        if execution_id:
+            body["execution_id"] = execution_id  # lets us abort this run later
         return body
 
     def converse(self, **kw) -> dict:
-        return self.kb("POST", "/api/agent_builder/converse", self.converse_body(**kw), timeout=300)
+        eid = kw.pop("execution_id", None) or str(uuid.uuid4())
+        try:
+            return self.kb("POST", "/api/agent_builder/converse", self.converse_body(execution_id=eid, **kw), timeout=300)
+        except KeyboardInterrupt:
+            self.abort_execution(eid, wait=False)
+            raise
 
     def converse_stream(self, **kw) -> Iterator[tuple[str, dict]]:
         """Yield (event_type, data) from POST /converse/async. ``data`` is the inner payload."""

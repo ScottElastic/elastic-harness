@@ -25,11 +25,14 @@ class Ui:
         self.auto_yes = auto_yes
         self._live: Live | None = None
         self._buf = ""
+        self._run = ""  # the text block being streamed now
+        self.last_answer = ""  # the last complete text block (for /copy)
         self.streamed = False
 
     # -- model text --------------------------------------------------------------------------
     def text(self, chunk: str) -> None:
         self.streamed = True
+        self._run += chunk
         if not self.console.is_terminal:
             sys.stdout.write(chunk)
             sys.stdout.flush()
@@ -42,6 +45,9 @@ class Ui:
         self._live.update(Markdown(self._buf))
 
     def flush(self) -> None:
+        if self._run.strip():
+            self.last_answer = self._run
+        self._run = ""
         if self._live is not None:
             self._live.stop()
             self._live = None

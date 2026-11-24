@@ -21,18 +21,26 @@ from pathlib import Path
 
 from rich.console import Console
 
+import dataclasses
+import os
+import subprocess
+
+from elastic_harness import agentcode, transcript
 from elastic_harness.agent_chat import history_lines, run_turn
 from elastic_harness.client import ApiError, Elastic
+from elastic_harness.compare import run_compare
 from elastic_harness.config import STATE_DIR, Config
 from elastic_harness.ingest import ingest
 from elastic_harness.local_agent import LocalSession
+from elastic_harness.mentions import expand_elastic_mentions
 from elastic_harness.render import Ui
-from elastic_harness.repl import match_models
+from elastic_harness.repl import Repl, match_models
 from elastic_harness.tools import Ctx
 
 ROOT = Path(__file__).resolve().parent.parent
 SAMPLE = ROOT / "examples" / "kestrel"
 AGENT, TOOL, INDEX = "eh-demo", "eh-search-kestrel", "eh-local-kestrel"
+CODE_AGENT = "eh-code-demo"
 STATE = STATE_DIR / "rehearse-state.json"
 
 
@@ -43,13 +51,21 @@ class Rec(Ui):
         super().__init__(Console(file=io.StringIO(), highlight=False), auto_yes=True)
         self.out: list[str] = []
         self.tools: list[str] = []
+        self.conv = None
 
     def text(self, chunk):
         self.streamed = True
+        self._run += chunk
         self.out.append(chunk)
 
     def flush(self):
-        pass
+        if self._run.strip():
+            self.last_answer = self._run
+        self._run = ""
+
+    def raw(self, event, data):
+        if event == "conversation_id_set":
+            self.conv = data.get("conversation_id")
 
     def tool_call(self, name, params):
         self.tools.append(name)
@@ -94,6 +110,7 @@ def cleanup(client: Elastic) -> None:
         except ApiError as exc:
             print(f"  conversation {cid}: {exc}")
     for label, call in (("agent", lambda: client.kb("DELETE", f"/api/agent_builder/agents/{AGENT}")),
+                        ("code agent", lambda: client.kb("DELETE", f"/api/agent_builder/agents/{CODE_AGENT}")),
                         ("tool", lambda: client.kb("DELETE", f"/api/agent_builder/tools/{TOOL}")),
                         ("index", lambda: client.es("DELETE", f"/{INDEX}"))):
         try:
@@ -232,9 +249,243 @@ def main() -> int:
         ls3.turn("Create a file called hello.txt containing the word hi.")
         check("write was not performed without approval", not (Path(d) / "hello.txt").exists())
 
+    new_features(client, s, models, haiku, sonnet, a, count)
+
     ok = sum(1 for _, p, _ in results if p)
     print(f"\n{ok}/{len(results)} checks passed")
     return 0 if ok == len(results) else 1
+
+
+class Bomb(Rec):
+    """Raises KeyboardInterrupt after n streamed chunks: the same path as the user pressing Ctrl+C."""
+
+    def __init__(self, n):
+        super().__init__()
+        self.n, self.chunks = n, 0
+
+    def text(self, chunk):
+        super().text(chunk)
+        self.chunks += 1
+        if self.chunks >= self.n:
+            raise KeyboardInterrupt
+
+
+def isolated_config(profile_name: str | None):
+    """A temp config holding a copy of the active profile, so the rehearsal never edits the real one."""
+    real = Config()
+    prof = real.get(profile_name)
+    tmp = Path(tempfile.mkdtemp(prefix="eh-rehearse-cfg-"))
+    cfg = Config(tmp / "config.json")
+    cfg.add(dataclasses.replace(prof))
+    return cfg, prof
+
+
+def new_features(client: Elastic, s: dict, models: list[str], haiku: str, sonnet: str, a, count: int) -> None:
+    cfg, prof = isolated_config(a.profile)
+    here = Path.cwd()
+
+    print("\n8. spaces: list, switch, agents are per space")
+    ui = Rec()
+    r = Repl(cfg, ui, profile=prof.name, agent=AGENT, model="haiku 4.5")
+    spaces = [x["id"] for x in client.spaces()]
+    check("spaces listed", "default" in spaces, str(spaces))
+    other = next((x for x in spaces if x != r.client.space), None)
+    if other:
+        r.handle(f"/space {other}")
+        check("switched space and re-listed agents", r.client.space == other and r.agents_cache is not None, ui.console.file.getvalue()[-200:])
+        check("fell back when the agent is not in that space", r.agent_id in [x["id"] for x in r.agents_cache], r.agent_id)
+        r.handle(f"/space {prof.space}")
+        check("switched back", r.client.space == prof.space and r.agent_id)
+        r.agent_id = AGENT
+    r.handle("/space definitely-not-a-space")
+    check("unknown space rejected, space unchanged", r.client.space == prof.space and "no space" in ui.console.file.getvalue())
+
+    print("\n9. clusters: switch, add (creds read in place), remove; Keychain round trip")
+    if prof.creds_file:
+        r.handle(f"/cluster add eh-rehearse-copy --creds {prof.creds_file}")
+        r.handle("/cluster eh-rehearse-copy")
+        check("added and switched cluster", r.raw.name == "eh-rehearse-copy" and r.client.version(), r.raw.name)
+        check("key not copied into the config file", "API_KEY" not in (cfg.path.read_text()) and prof.creds_file in cfg.path.read_text())
+        r.handle(f"/cluster {prof.name}")
+        r.handle("/cluster rm eh-rehearse-copy")
+        check("switched back and removed the copy", r.raw.name == prof.name and "eh-rehearse-copy" not in cfg.profiles)
+        r.agent_id = AGENT
+        r.model = haiku
+    probe = ("import sys; from elastic_harness import credstore as c; "
+             "assert c.available(), 'no keychain'; "
+             "assert c.set('eh-rehearse-dummy','not-a-real-key'); "
+             "ok = c.get('eh-rehearse-dummy') == 'not-a-real-key'; c.delete('eh-rehearse-dummy'); "
+             "ok = ok and c.get('eh-rehearse-dummy') is None; sys.exit(0 if ok else 1)")
+    try:
+        kc = subprocess.run([sys.executable, "-c", probe], capture_output=True, timeout=25)
+        check("macOS Keychain store/read/delete round trip", kc.returncode == 0, kc.stderr.decode()[-200:])
+    except subprocess.TimeoutExpired:
+        check("macOS Keychain store/read/delete round trip", False, "timed out (an access prompt may be waiting on screen)")
+
+    print("\n10. compare the same prompt on two models")
+    before = len(client.conversations())
+    res = run_compare(client, [haiku, sonnet], "What is the go-live date of Project Kestrel? Answer in one line.", mode="agent", agent_id=AGENT)
+    check("both models answered correctly", all(has(x.answer, "2026-12-03") for x in res), str([(x.model[-30:], x.error or x.answer[:60]) for x in res]))
+    check("two different models reported tokens", all(x.tokens_in > 0 for x in res))
+    check("comparison chats cleaned up", len(client.conversations()) == before, f"{before} -> {len(client.conversations())}")
+    plain = run_compare(client, [haiku, sonnet], "Reply with the single word: ok", mode="local", agent_id=AGENT)
+    check("local-mode compare runs plain model answers", all(x.answer.strip() and not x.error for x in plain))
+
+    print("\n11. retry, copy, export, open")
+    ui = Rec()
+    r = Repl(cfg, ui, profile=prof.name, agent=AGENT, model="haiku 4.5")
+    r.handle("Who owns Project Kestrel? One line.")
+    s["conversations"].append(r.conversation_id)
+    save_state(s)
+    check("answer captured for /copy", has(ui.last_answer, "Priya"), ui.last_answer[:100])
+    copied = []
+    orig = transcript.copy_to_clipboard
+    transcript.copy_to_clipboard = lambda t: copied.append(t) or "test"  # never touch your real clipboard
+    r.handle("/copy")
+    transcript.copy_to_clipboard = orig
+    check("/copy hands the last answer to the clipboard", copied and has(copied[0], "Priya"))
+    out = Path(tempfile.mkdtemp()) / "t.md"
+    r.handle(f"/export {out}")
+    check("/export wrote the conversation", out.exists() and has(out.read_text(), "Priya", "Who owns"), "")
+    urls = []
+    orig_open = transcript.open_url
+    transcript.open_url = lambda u: urls.append(u) or True
+    r.handle("/open")
+    transcript.open_url = orig_open
+    check("/open builds the Kibana conversation link", urls and urls[0].endswith(f"/app/agent_builder/agents/{AGENT}/conversations/{r.conversation_id}"), str(urls))
+    print(f"       link to try in a browser: {urls[0] if urls else '-'}")
+    first = r.conversation_id
+    r.handle("/retry")
+    s["conversations"].append(r.conversation_id)
+    save_state(s)
+    check("/retry runs the last prompt on a fresh conversation", r.conversation_id and r.conversation_id != first and has(ui.last_answer, "Priya"))
+
+    print("\n12. real Ctrl+C: stops the run on the server (dropping the connection does not)")
+    essay = "Write a 700 word essay about the history of the lighthouse. No tools."
+    over = {"enable_elastic_capabilities": False, "tools": [], "skill_ids": []}
+    bomb = Bomb(6)
+    interrupted = False
+    try:
+        run_turn(client, bomb, agent_id="elastic-ai-agent", text=essay, conversation_id=None, model=haiku, overrides=over)
+    except KeyboardInterrupt:
+        interrupted = True
+    check("interrupt propagated after aborting", interrupted)
+    time.sleep(6)
+    if bomb.conv:
+        conv = client.conversation(bomb.conv)
+        out_tokens = (conv["rounds"][0].get("model_usage") or {}).get("output_tokens", 0)
+        check("server stopped generating (full essay is ~900 tokens)", out_tokens < 400, f"output_tokens={out_tokens}")
+        client.delete_conversation(bomb.conv)
+    else:
+        check("server stopped generating", False, "no conversation id captured")
+
+    print("\n13. @index / @alert / @case mentions")
+    ui = Rec()
+    r = Repl(cfg, ui, profile=prof.name, agent=AGENT, model="haiku 4.5")
+    text, notes = expand_elastic_mentions(f"describe @index:{INDEX}", client)
+    check("@index attaches fields and sample docs", "<elastic_index" in text and "content:text" in text and notes[0]["status"] == "attached", str(notes))
+    r.handle(f"@index:{INDEX} Name two fields this index has. One line.")
+    s["conversations"].append(r.conversation_id)
+    save_state(s)
+    check("agent answered from the attached index description", has(ui.last_answer, "content") or has(ui.last_answer, "path"), ui.last_answer[:120])
+    found = None
+    probe_client = Elastic(prof)
+    for sp in spaces:
+        probe_client.space = sp
+        try:
+            hit = probe_client.kb("POST", "/api/detection_engine/signals/search", {"query": {"match_all": {}}, "size": 1})["hits"]["hits"]
+            cases = probe_client.kb("GET", "/api/cases/_find?perPage=1").get("cases", [])
+        except ApiError:
+            continue
+        if hit:
+            found = (sp, hit[0]["_id"], cases[0]["id"] if cases else None)
+            break
+    if found:
+        probe_client.space = found[0]
+        text, notes = expand_elastic_mentions(f"look at @alert:{found[1]}" + (f" and @case:{found[2]}" if found[2] else ""), probe_client)
+        check(f"@alert pulled a real alert (space {found[0]})", "<elastic_alert" in text and "kibana.alert.rule.name" in text, str(notes))
+        if found[2]:
+            check("@case pulled a real case", "<elastic_case" in text, str(notes))
+        _, missing = expand_elastic_mentions("@alert:does-not-exist", probe_client)
+        check("a missing alert is reported, not fatal", "not found" in missing[0]["status"])
+    else:
+        print("       (no space with alerts on this cluster: @alert/@case live checks skipped)")
+
+    print("\n14. agents as code: pull, diff, push, guards")
+    work = Path(tempfile.mkdtemp(prefix="eh-agents-"))
+    try:  # our own object from an earlier run: start clean so "create" really creates
+        client.kb("DELETE", f"/api/agent_builder/agents/{CODE_AGENT}")
+    except ApiError:
+        pass
+    pulled = agentcode.pull(client, AGENT, str(work))
+    check("pull wrote a Markdown file with the tool and instructions", has(pulled.read_text(), TOOL, "Kestrel"), "")
+    res = agentcode.push(client, str(pulled), confirm=lambda t, d: True, say=lambda m: None)
+    check("pushing an unchanged pull is a no-op", res["action"] == "unchanged", str(res))
+    new = work / "new.md"
+    new.write_text(pulled.read_text().replace(f"id: {AGENT}", f"id: {CODE_AGENT}").replace("EH Demo (Kestrel notes)", "EH Code Demo"))
+    res = agentcode.push(client, str(new), confirm=lambda t, d: True, say=lambda m: None)
+    check("push created a new agent from the file", res["action"] == "created" and client.agent(CODE_AGENT)["name"] == "EH Code Demo", str(res))
+    new.write_text(new.read_text().replace("Quote dates and names exactly", "Quote dates and names exactly, and keep answers to one line"))
+    said = []
+    res = agentcode.push(client, str(new), confirm=lambda t, d: True, say=said.append)
+    check("editing the file shows a diff and updates the agent", res["action"] == "updated" and any("one line" in m for m in said), str(res))
+    check("repeat push is unchanged", agentcode.push(client, str(new), confirm=lambda t, d: True, say=lambda m: None)["action"] == "unchanged")
+    new.write_text(new.read_text().replace("one line", "two lines"))
+    declined = agentcode.push(client, str(new), confirm=lambda t, d: False, say=lambda m: None)
+    check("declined confirmation changes nothing", declined["action"] == "cancelled" and "one line" in client.agent(CODE_AGENT)["configuration"]["instructions"])
+    ui = Rec()
+    run_turn(client, ui, agent_id=CODE_AGENT, text="Who owns Project Kestrel? One line.", conversation_id=None, model=haiku)
+    check("the pushed agent answers from the ingested data", has(ui.answer, "Priya"), ui.answer[:100])
+    risky = next((t["id"] for t in client.tools() if agentcode.RISKY.search(t["id"])), None)
+    if risky:
+        bad = work / "bad.md"
+        bad.write_text(pulled.read_text().replace(f"id: {AGENT}", "id: eh-risky-never").replace(f"  - {TOOL}", f"  - {TOOL}\n  - {risky}"))
+        try:
+            agentcode.push(client, str(bad), confirm=lambda t, d: True, say=lambda m: None)
+            check("a workflow-executing built-in is refused", False, "push succeeded")
+        except PermissionError:
+            check("a workflow-executing built-in is refused", True)
+
+    print("\n15. EH.md project instructions and custom commands")
+    proj = Path(tempfile.mkdtemp(prefix="eh-proj-"))
+    (proj / ".eh" / "commands").mkdir(parents=True)
+    (proj / "EH.md").write_text("House rule: end every answer with the exact token DONE-EH.")
+    (proj / ".eh" / "commands" / "owner.md").write_text(f"---\ndescription: who owns a project\nagent: {AGENT}\nmodel: haiku 4.5\n---\nWho owns Project $1 and what is its go-live date? One line.")
+    os.chdir(proj)
+    try:
+        ui = Rec()
+        r = Repl(cfg, ui, profile=prof.name)
+        check("project command discovered", "owner" in r.cmds and r.context_files, str(list(r.cmds)))
+        r.handle("/owner Kestrel")
+        s["conversations"].append(r.conversation_id)
+        save_state(s)
+        check("custom command ran with its own agent and model", has(ui.last_answer, "Priya") and has(ui.last_answer, "2026-12-03"), ui.last_answer[:120])
+        check("EH.md instructions were followed", "DONE-EH" in ui.last_answer.upper(), ui.last_answer[-80:])
+        check("command overrides did not stick", r.agent_id != AGENT or prof.default_agent == AGENT)
+    finally:
+        os.chdir(here)
+
+    print("\n16. local-mode context compaction")
+    import elastic_harness.local_agent as la
+    ui = Rec()
+    old = la.CONTEXT_TOKENS
+    la.CONTEXT_TOKENS = 350  # tiny, so three short files are enough to trigger it
+    try:
+        ls = LocalSession(Ctx(client, ui, SAMPLE, sonnet), [])
+        ls.turn("Read overview.md and tell me the budget. One line.")
+        ls.turn("Now read meeting-2026-11-18.md and tell me who has the cracked reader on order. One line.")
+        ls.turn("Now read risks.csv and tell me the owner of risk R3. One line.")
+        info = ui.console.file.getvalue()
+        check("history was compacted automatically", "context compacted" in info, info[-200:])
+        check("the summary replaced the older turns", ls.messages[0]["content"].startswith(la.SUMMARY_TAG), str(ls.messages[0])[:120])
+        ui.reset()
+        ls.turn("Without reading any file again, answer as three short numbered lines: 1) the project budget, "
+                "2) who has the cracked reader on order, 3) who owns risk R3.")
+        check("facts from every earlier turn survived compaction",
+              has(ui.last_answer, "184") and has(ui.last_answer, "Dev Patel") and has(ui.last_answer, "Priya"), ui.last_answer[:200])
+        check("answered from the summary without re-reading files", not any(t in ("read_file", "grep") for t in ui.tools[-1:]), str(ui.tools[-3:]))
+    finally:
+        la.CONTEXT_TOKENS = old
 
 
 if __name__ == "__main__":

@@ -18,6 +18,10 @@ All facts verified on Kibana/Elasticsearch **9.6.0** (Elastic Cloud, traditional
 | Local-mode LLM | `POST /_inference/chat_completion/{id}/_stream` | OpenAI-style SSE with streamed `tool_calls`; `[DONE]` terminates |
 | ES\|QL | `POST /_query` | Read-only by nature |
 | Spaces | prefix `/s/<space>` before `/api/…` *(docs)* | The default space needs no prefix |
+| List spaces | `GET /api/spaces/space` | Not space-scoped; returned `default`, `my-space` |
+| Stop a run | `POST /internal/agent_builder/executions/{execution_id}/abort` | **Internal** API: needs `x-elastic-internal-origin: kibana` and `Elastic-Api-Version: 1`; returns `{acknowledged, terminal_persisted}` |
+| Alert by id | `POST /api/detection_engine/signals/search` `{query:{ids:{values:[id]}}}` | Space-scoped and RBAC-respecting; `_source` has dotted keys (about 90 fields) |
+| Case | `GET /api/cases/{id}`, `/comments/_find?perPage=20`, `/alerts` | `GET /cases/{id}/comments` itself is 404 |
 
 `/api/oas` returns 404 on 9.6.0, so there is no machine-readable spec from the cluster. The Kibana API reference
 and the `docs-content` repo are the sources.
@@ -36,6 +40,19 @@ Observed on 9.6.0: `conversation_id_set`, `reasoning`, `message_chunk`, `browser
 rehearsal `tool_call`, `message_complete`, `round_complete`. The full enum *(source)* also has `prompt_request`,
 `tool_progress`, `round_interrupted`, `model_reasoning_chunk`, `conversation_created`, and more. Kibana pads the
 stream with `: 000…` comment lines (ignored); Elasticsearch's stream starts each event with a BOM (stripped).
+
+## Stopping a run (Ctrl+C)
+
+Verified on 9.6.0: starting `/converse/async` with a client-chosen `execution_id`, reading a few chunks and **dropping the
+connection does not stop the agent**. Kibana finishes the round (5,418 characters and 934 output tokens were saved to the
+conversation 25 s later) and bills for it. The harness therefore sends an `execution_id` with every run and, on Ctrl+C,
+calls the internal abort route. The run then stops: a long essay aborted after 6 chunks saved 0 output tokens instead of 934.
+The route is absent from the public API reference and is internal-only, hence the defensive `False` return.
+
+## Deep links
+
+`/open` uses `<kibana>/s/<space>/app/agent_builder/agents/<agentId>/conversations/<conversationId>` (route table in the 9.6
+branch of Kibana, `agent_builder/public/application/route_config.tsx`). Cases: `/app/security/cases/<id>`.
 
 ## Why local mode exists: `browser_api_tools` are fire-and-forget
 
@@ -61,6 +78,19 @@ A tool that needs approval makes the stream emit `prompt_request` with `prompt: 
 `conversation_id` and `prompts: {<id>: {allow: bool} | {authorized: bool} | {answers: [...]}}`. `agent_chat.py`
 implements this.
 
+## Credential store
+
+`credstore.py` wraps the `keyring` package (macOS Keychain, service `elastic-harness`, account = cluster name). A profile
+with `key_store: keychain` has no `api_key` in the config file; `Profile.resolved()` reads it at connect time and raises a
+clear error if the entry is gone. `Config.store_key` falls back to the mode-600 file where no Keychain exists.
+
+## Compaction
+
+`LocalSession.compact` trims old tool results, then summarises everything before the kept turns, using the *untrimmed*
+originals. Lesson from a live run: feeding the summariser tool results cut to 400 characters made it conclude files were
+"cut off mid-word" and write a bogus "Correction needed" into the summary. Tool output is now passed up to 4,000
+characters with an explicit "shortened for this summary" note, and the prompt forbids speculation.
+
 ## Module map
 
 | File | Role |
@@ -74,3 +104,8 @@ implements this.
 | `ingest.py` | Chunking, `eh-local-*` indices, `index_search` tool and agent attach |
 | `render.py` | rich output: live Markdown, dim tool lines, confirmations |
 | `repl.py`, `cli.py` | Slash commands, completion, argparse entry point |
+| `clusters.py`, `credstore.py` | Cluster list (add, test, rm, secure) and the Keychain wrapper |
+| `mentions.py` | `@alert:`, `@case:`, `@index:` |
+| `agentcode.py`, `frontmatter.py` | Agents as code; the tiny front-matter parser |
+| `project.py` | `EH.md` and custom command discovery |
+| `compare.py`, `transcript.py` | `/compare`; `/copy`, `/export`, `/open` helpers |

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from .client import Elastic
 from .render import Ui, short
 
@@ -58,37 +60,51 @@ def run_turn(client: Elastic, ui: Ui, *, agent_id: str, text: str, conversation_
     for _ in range(6):  # a turn can pause for approvals more than once
         pending: list[dict] = []
         ui.streamed = False
-        for event, d in client.converse_stream(agent_id=agent_id, text=text if prompts is None else "",
-                                               conversation_id=state["conversation_id"], model=model,
-                                               overrides=overrides, prompts=prompts):
-            ui.raw(event, d)
-            if event == "conversation_id_set":
-                state["conversation_id"] = d.get("conversation_id") or state["conversation_id"]
-            elif event == "message_chunk":
-                ui.text(d.get("text_chunk", ""))
-            elif event == "message_complete":
-                if not ui.streamed and d.get("message_content"):
-                    ui.text(d["message_content"])
-            elif event == "reasoning":
-                if not d.get("transient") and d.get("reasoning"):
-                    ui.reasoning(d["reasoning"])
-            elif event == "tool_call":
-                state["tools"].append(d.get("tool_id"))
-                ui.tool_call(d.get("tool_id", "?"), d.get("params", {}))
-            elif event == "tool_result":
-                ui.tool_result(_result_summary(d))
-            elif event == "prompt_request":
-                pending.append(d)
-            elif event == "round_complete":
-                rnd = d.get("round", d)
-                state["usage"] = rnd.get("model_usage") or state["usage"]
-            elif event == "error":
-                ui.error(short(d, 300))
+        eid = str(uuid.uuid4())
+        stream = client.converse_stream(agent_id=agent_id, text=text if prompts is None else "",
+                                        conversation_id=state["conversation_id"], model=model,
+                                        overrides=overrides, prompts=prompts, execution_id=eid)
+        try:
+            _consume(client, ui, stream, state, pending)
+        except KeyboardInterrupt:
+            # closing the connection does not stop the agent: abort the execution itself
+            ui.flush()
+            stopped = client.abort_execution(eid)
+            ui.warn("stopped the agent run on the server" if stopped else
+                    "could not confirm the abort: the agent may still finish in the background")
+            raise
         ui.flush()
         if not pending:
             break
         prompts = _answer_prompts(ui, pending)
     return state
+
+
+def _consume(client: Elastic, ui: Ui, stream, state: dict, pending: list) -> None:
+    for event, d in stream:
+        ui.raw(event, d)
+        if event == "conversation_id_set":
+            state["conversation_id"] = d.get("conversation_id") or state["conversation_id"]
+        elif event == "message_chunk":
+            ui.text(d.get("text_chunk", ""))
+        elif event == "message_complete":
+            if not ui.streamed and d.get("message_content"):
+                ui.text(d["message_content"])
+        elif event == "reasoning":
+            if not d.get("transient") and d.get("reasoning"):
+                ui.reasoning(d["reasoning"])
+        elif event == "tool_call":
+            state["tools"].append(d.get("tool_id"))
+            ui.tool_call(d.get("tool_id", "?"), d.get("params", {}))
+        elif event == "tool_result":
+            ui.tool_result(_result_summary(d))
+        elif event == "prompt_request":
+            pending.append(d)
+        elif event == "round_complete":
+            rnd = d.get("round", d)
+            state["usage"] = rnd.get("model_usage") or state["usage"]
+        elif event == "error":
+            ui.error(short(d, 300))
 
 
 def usage_line(usage: dict | None) -> str:

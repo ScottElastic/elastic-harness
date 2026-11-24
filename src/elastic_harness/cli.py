@@ -6,10 +6,11 @@ import argparse
 import getpass
 import os
 import sys
+from pathlib import Path
 
-from . import __version__
+from . import __version__, agentcode, clusters
 from .client import ApiError, Elastic
-from .config import Config, ConfigError, Profile
+from .config import Config, ConfigError
 from .ingest import ingest
 from .render import Ui
 from .repl import Repl
@@ -18,30 +19,48 @@ from .repl import Repl
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="eh", description="Elastic Harness: a terminal harness for Elastic Agent Builder")
     p.add_argument("--version", action="version", version=f"elastic-harness {__version__}")
-    p.add_argument("--profile", help="profile to use (default: the active one)")
+    p.add_argument("--cluster", "--profile", dest="cluster", help="cluster to use (default: the active one)")
+    p.add_argument("--space", help="Kibana space for this run (default: the cluster's space)")
     p.add_argument("--agent", help="Agent Builder agent id")
     p.add_argument("--model", help="model words, e.g. 'sonnet 5.5' (see: eh models)")
     p.add_argument("--mode", choices=["agent", "local"], help="agent = an Elastic agent answers; local = tools run on this Mac")
     p.add_argument("-p", "--print", dest="prompt", metavar="PROMPT", help="run one prompt, print the answer, exit")
-    p.add_argument("--yes", action="store_true", help="auto-approve tool confirmations (one-shot runs)")
+    p.add_argument("--yes", action="store_true", help="auto-approve confirmations (one-shot runs, agent push, …)")
     p.add_argument("--debug", action="store_true", help="show raw stream events")
     sub = p.add_subparsers(dest="cmd")
 
-    pr = sub.add_parser("profile", help="manage cluster profiles")
-    ps = pr.add_subparsers(dest="action", required=True)
-    add = ps.add_parser("add", help="add or replace a profile")
+    cl = sub.add_parser("cluster", aliases=["profile"], help="manage the clusters you can connect to")
+    cs = cl.add_subparsers(dest="action", required=True)
+    add = cs.add_parser("add", help="add or replace a cluster")
     add.add_argument("name")
-    add.add_argument("--creds", help="JSON file with KIBANA_URL, ES_URL, API_KEY (read in place, never copied)")
+    add.add_argument("--creds", help="JSON file with KIBANA_URL, ES_URL, API_KEY: read in place, never copied")
+    add.add_argument("--import", dest="import_file", help="copy KIBANA_URL, ES_URL and API_KEY from this JSON file into the key store")
     add.add_argument("--kibana-url")
     add.add_argument("--es-url")
     add.add_argument("--api-key-env", help="read the API key from this environment variable")
-    add.add_argument("--space", default="default")
+    add.add_argument("--space", dest="cluster_space", default="default")
     add.add_argument("--default-agent", default="elastic-ai-agent")
-    ps.add_parser("list", help="list profiles")
-    use = ps.add_parser("use", help="make a profile the default")
-    use.add_argument("name")
-    rm = ps.add_parser("rm", help="remove a profile")
-    rm.add_argument("name")
+    add.add_argument("--use", action="store_true", help="make it the active cluster")
+    cs.add_parser("list", help="list clusters")
+    for name, helptext in (("use", "make a cluster the default"), ("rm", "remove a cluster and its stored key"),
+                           ("test", "connect and report, without switching"), ("secure", "move a plaintext key into the Keychain")):
+        sp = cs.add_parser(name, help=helptext)
+        sp.add_argument("name", nargs="?" if name == "test" else None)
+
+    ag = sub.add_parser("agent", help="agents as code: push, pull, diff")
+    ags = ag.add_subparsers(dest="action", required=True)
+    push = ags.add_parser("push", help="create or update an agent from a Markdown file")
+    push.add_argument("file")
+    push.add_argument("--dry-run", action="store_true", help="show the diff, change nothing")
+    push.add_argument("--allow-risky", action="store_true", help="allow tools that can run or approve workflows")
+    diff = ags.add_parser("diff", help="show how a file differs from the agent on the cluster")
+    diff.add_argument("file")
+    pull = ags.add_parser("pull", help="write agents on the cluster to Markdown files")
+    pull.add_argument("agent_id", nargs="?")
+    pull.add_argument("-o", "--out", default="agents")
+    pull.add_argument("--all", action="store_true")
+    pull.add_argument("--force", action="store_true")
+    ags.add_parser("list", help="list agents")
 
     sub.add_parser("agents", help="list agents")
     sub.add_parser("models", help="list chat models")
@@ -54,33 +73,58 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def _profile_cmd(cfg: Config, a: argparse.Namespace, ui: Ui) -> int:
+def _cluster_cmd(cfg: Config, a: argparse.Namespace, ui: Ui) -> int:
     if a.action == "list":
-        for n, p in cfg.profiles.items():
-            ui.console.print(f"{'[green]●[/green]' if n == cfg.active else ' '} {n}  [dim]{p.space} · {p.creds_file or p.kibana_url}[/dim]")
+        for r in clusters.rows(cfg):
+            ui.console.print(f"{'[green]●[/green]' if r['active'] else ' '} {r['name']}  [dim]{r['host']} · space {r['space']} · key: {r['key']}[/dim]")
         return 0
     if a.action == "use":
-        cfg.get(a.name)
-        cfg.active = a.name
+        cfg.active = cfg.get(a.name).name
         cfg.save()
-        ui.ok(f"active profile: {a.name}")
+        ui.ok(f"active cluster: {cfg.active}")
         return 0
     if a.action == "rm":
-        cfg.profiles.pop(a.name, None)
-        cfg.active = next(iter(cfg.profiles), "") if cfg.active == a.name else cfg.active
-        cfg.save()
-        ui.ok(f"removed {a.name}")
+        name = cfg.get(a.name).name
+        cfg.remove(name)
+        ui.ok(f"removed {name} (and its stored key)")
         return 0
-    prof = Profile(name=a.name, space=a.space, default_agent=a.default_agent, creds_file=os.path.expanduser(a.creds or ""),
-                   kibana_url=a.kibana_url or "", es_url=a.es_url or "")
-    if not a.creds:
-        prof.kibana_url = prof.kibana_url or ui.ask("Kibana URL")
-        prof.es_url = prof.es_url or ui.ask("Elasticsearch URL")
-        prof.api_key = os.environ.get(a.api_key_env or "", "") or getpass.getpass("API key (hidden): ")
-    client = Elastic(prof)  # resolves creds; raises ConfigError/ValueError on problems
-    version = client.version()
-    cfg.add(prof)
-    ui.ok(f"profile {a.name} saved ({'creds read in place from ' + a.creds if a.creds else 'key stored in ' + str(cfg.path) + ', mode 600'}) · Kibana {version}")
+    if a.action == "secure":
+        ui.ok(f"{a.name}: key now in {cfg.secure(a.name)}")
+        return 0
+    if a.action == "test":
+        info = clusters.test_cluster(cfg, a.name)
+        ui.ok(f"{info['name']} · {info['host']} · Kibana {info['version']} · space {info['space']} · user {info.get('user')} · "
+              f"{info['agents']} agents · {info['models']} models")
+        return 0
+    secret = (lambda _q: os.environ.get(a.api_key_env, "")) if a.api_key_env else getpass.getpass
+    prof, where, version = clusters.add_cluster(cfg, a.name, creds=a.creds, import_file=a.import_file, kibana_url=a.kibana_url or "",
+                                                es_url=a.es_url or "", space=a.cluster_space, default_agent=a.default_agent,
+                                                make_active=True if a.use else None, ask=ui.ask, secret=secret)
+    ui.ok(f"cluster {prof.name} added · key: {where} · Kibana {version}" + ("" if cfg.active == prof.name else f" · `eh cluster use {prof.name}` to make it the default"))
+    return 0
+
+
+def _agent_cmd(cfg: Config, a: argparse.Namespace, ui: Ui) -> int:
+    client = Elastic(cfg.get(a.cluster))
+    if a.space:
+        client.space = a.space
+    if a.action == "list":
+        for ag in client.agents():
+            ui.console.print(f"{ag['id']}  [dim]{ag.get('name', '')} · {(ag.get('access_control') or {}).get('access_mode', '')}[/dim]")
+        return 0
+    if a.action in ("push", "diff"):
+        res = agentcode.push(client, a.file, confirm=lambda t, d: ui.confirm(t, d, allow_always=False) == "y",
+                             say=lambda m: ui.console.print(m, markup=False, highlight=False),
+                             allow_risky=getattr(a, "allow_risky", False), dry_run=a.action == "diff" or a.dry_run)
+        ui.ok(f"{res['id']}: {res['action']}  [cluster {client.profile.name} · space {client.space}]")
+        return 0
+    if a.all:
+        paths = agentcode.pull_all(client, a.out, force=a.force)
+        ui.ok(f"pulled {len(paths)} agents into {a.out}/")
+    elif a.agent_id:
+        ui.ok(f"wrote {agentcode.pull(client, a.agent_id, a.out, force=a.force)}")
+    else:
+        raise ValueError("give an agent id, or --all")
     return 0
 
 
@@ -89,9 +133,11 @@ def main(argv: list[str] | None = None) -> int:
     ui = Ui(debug=a.debug, auto_yes=a.yes)
     try:
         cfg = Config()
-        if a.cmd == "profile":
-            return _profile_cmd(cfg, a, ui)
-        repl = Repl(cfg, ui, profile=a.profile, agent=a.agent, model=a.model, mode=a.mode)
+        if a.cmd in ("cluster", "profile"):
+            return _cluster_cmd(cfg, a, ui)
+        if a.cmd == "agent":
+            return _agent_cmd(cfg, a, ui)
+        repl = Repl(cfg, ui, profile=a.cluster, agent=a.agent, model=a.model, mode=a.mode, space=a.space)
         if a.cmd == "agents":
             repl.cmd_agents("")
         elif a.cmd == "models":
@@ -99,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "doctor":
             repl.cmd_doctor("")
         elif a.cmd == "ingest":
+            ui.info(f"target: cluster {repl.raw.name} · space {repl.client.space}")
             res = ingest(repl.client, a.path, a.index, a.tool, a.attach_agent, say=ui.info)
             ui.ok("ingested {files} files → {chunks} chunks into {index} ({skipped} skipped, {failed} failed)".format(**res))
             if res.get("tool"):
