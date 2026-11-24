@@ -22,11 +22,12 @@ def short(value, limit: int = 140) -> str:
 
 class Ui:
     def __init__(self, console: Console | None = None, debug: bool = False, auto_yes: bool = False,
-                 status: TabStatus | None = None):
+                 status: TabStatus | None = None, silent_text: bool = False):
         self.console = console or Console(highlight=False)
         self.status = status or TabStatus(stream=None, env={})  # a disabled one: tests and pipes never emit
         self.debug = debug
         self.auto_yes = auto_yes
+        self.silent_text = silent_text  # collect the model's text but print none of it (`eh -p --json` prints it as JSON)
         self._live: Live | None = None
         self._buf = ""
         self._run = ""  # the text block being streamed now
@@ -37,6 +38,8 @@ class Ui:
     def text(self, chunk: str) -> None:
         self.streamed = True
         self._run += chunk
+        if self.silent_text:
+            return
         if not self.console.is_terminal:
             sys.stdout.write(chunk)
             sys.stdout.flush()
@@ -56,7 +59,7 @@ class Ui:
             self._live.stop()
             self._live = None
             self._buf = ""
-        elif not self.console.is_terminal and self.streamed:
+        elif not self.console.is_terminal and self.streamed and not self.silent_text:
             sys.stdout.write("\n")
         self.streamed = False
 

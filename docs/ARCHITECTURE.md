@@ -12,7 +12,8 @@ All facts verified on Kibana/Elasticsearch **9.6.0** (Elastic Cloud, traditional
 | Chat, single reply | `POST /api/agent_builder/converse` | Returns `conversation_id`, `response.message`, `steps`, `model_usage` |
 | Conversations | `GET/DELETE /api/agent_builder/conversations[/{id}]` | History is stored in Kibana, per user |
 | List / run tools | `GET /api/agent_builder/tools`, `POST …/tools/_execute {tool_id, tool_params}` | 81 built-in tools on this cluster |
-| Create tool | `POST /api/agent_builder/tools` | `index_search` takes `configuration.pattern` *(docs)* |
+| Create tool | `POST /api/agent_builder/tools` | `index_search` takes `configuration.pattern`; `esql` takes `configuration.query` and `params` (see *Custom tools*) |
+| Read / update a tool | `GET` / `PUT /api/agent_builder/tools/{id}` | `PUT` takes `description`, `tags`, `configuration` only: `type` (or `id`) in the body is a `400` |
 | Attach tool to agent | `PUT /api/agent_builder/agents/{id} {configuration}` | Full `configuration` round-trips cleanly |
 | List models | `GET /_inference` filtered to `task_type: chat_completion` | 58 endpoints here; ids like `.anthropic-claude-5.5-sonnet-chat_completion` |
 | Local-mode LLM | `POST /_inference/chat_completion/{id}/_stream` | OpenAI-style SSE with streamed `tool_calls`; `[DONE]` terminates |
@@ -33,6 +34,32 @@ and the `docs-content` repo are the sources.
 - Agents are not bound to a model, so any agent runs on any model.
 - `configuration_overrides: {enable_elastic_capabilities: false, tools: [], skill_ids: []}` took the default agent's
   prompt from about 45k to about 9k input tokens for a one-line chat.
+
+## Custom tools (`esql`, `index_search`)
+
+Verified on 9.6.0 by creating, reading, updating and deleting throwaway tools.
+
+- ES|QL tool: `{id, type: "esql", description, tags, configuration: {query, params}}`. `params` is a map of
+  `name → {type, description, optional?, defaultValue?}`; `type` is one of `string, integer, float, boolean, date, array`.
+  `?name` in the query is the placeholder. A param without `optional: true` is `required` in the tool's derived JSON schema.
+- Index search tool: `configuration: {pattern}` and nothing else.
+- Reads add fields the file does not carry: `readonly`, `experimental`, `confirmation: {askUser}` (`never` on every tool
+  seen here) and a derived `schema`. `eh tool` ignores them, so a pull followed by a push is `unchanged`.
+- A tool's `type` cannot change: `PUT` with `type` answers `400 Additional properties are not allowed`.
+- Ids: lowercase letters, numbers, `.`, `-`, `_`, starting and ending with a letter or number (`400` otherwise, with that
+  sentence). Dotted ids work (`eh.tool_probe2`); the built-ins use them (`platform.core.search`).
+- `optional: true` and `defaultValue` are echoed back when set (`defaultValue` with its JSON type). Writing `optional: false`
+  was not tried: `eh tool` leaves it out, since false is the default.
+- The built-in tools (81 here) come back with `readonly: true`; the custom ones with `readonly: false`.
+
+## Is the abort route still there? (`eh doctor`)
+
+`POST /internal/agent_builder/executions/{random uuid}/abort` with the internal headers (see *Stopping a run*). Nothing is
+running under a random id, so nothing is stopped. Verified on 9.6.0: the route answers `200 {"acknowledged": false,
+"terminal_persisted": false}`; a path that does not exist answers Kibana's generic `404 {"statusCode":404,"error":"Not Found",
+"message":"Not Found"}`. `client.classify_abort_probe` maps those to `present` and `missing`; anything else (403, 5xx, a
+different 404 body) is `unknown`, which doctor reports as "could not confirm". `clusters.VERIFIED_KIBANA` is the Kibana
+minor doctor compares against.
 
 ## Streaming events (agent mode)
 
@@ -114,9 +141,9 @@ characters with an explicit "shortened for this summary" note, and the prompt fo
 | `guard.py` | Secret-file refusal, `@path` expansion |
 | `ingest.py` | Chunking, `eh-local-*` indices, `index_search` tool and agent attach |
 | `render.py` | rich output: live Markdown, dim tool lines, confirmations |
-| `repl.py`, `cli.py` | Slash commands, completion, argparse entry point |
+| `repl.py`, `cli.py` | Slash commands, completion, argparse entry point; `-p`, `--json`, `-c`/`--resume` live in `cli.py` and `Repl.resume_for_cli`/`Repl.result` |
 | `clusters.py`, `credstore.py` | Cluster list (add, test, rm, secure) and the Keychain wrapper |
 | `mentions.py` | `@alert:`, `@case:`, `@index:` |
-| `agentcode.py`, `frontmatter.py` | Agents as code; the tiny front-matter parser |
+| `agentcode.py`, `toolcode.py`, `frontmatter.py` | Agents and tools as code; the tiny front-matter parser (nested maps, `# comments`) |
 | `project.py` | `EH.md` and custom command discovery |
 | `compare.py`, `transcript.py` | `/compare`; `/copy`, `/export`, `/open` helpers |

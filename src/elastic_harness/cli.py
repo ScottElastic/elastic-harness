@@ -5,11 +5,14 @@ from __future__ import annotations
 import argparse
 import atexit
 import getpass
+import json
 import os
 import sys
 from pathlib import Path
 
-from . import __version__, agentcode, clusters
+from rich.console import Console
+
+from . import __version__, agentcode, clusters, toolcode
 from .client import ApiError, Elastic
 from .config import Config, ConfigError
 from .ingest import ingest
@@ -27,6 +30,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="model words, e.g. 'sonnet 5.5' (see: eh models)")
     p.add_argument("--mode", choices=["agent", "local"], help="agent = an Elastic agent answers; local = tools run on this Mac")
     p.add_argument("-p", "--print", dest="prompt", metavar="PROMPT", help="run one prompt, print the answer, exit")
+    p.add_argument("--json", action="store_true",
+                   help="with -p: print one JSON object on stdout (answer, usage, tools, ids); progress goes to stderr")
+    cont = p.add_mutually_exclusive_group()
+    cont.add_argument("-c", "--continue", dest="cont", action="store_true",
+                      help="continue the most recent conversation (with --agent: the most recent one with that agent)")
+    cont.add_argument("--resume", metavar="ID", help="continue a specific conversation (local mode: a saved session id)")
     p.add_argument("--yes", action="store_true", help="auto-approve confirmations (one-shot runs, agent push, …)")
     p.add_argument("--debug", action="store_true", help="show raw stream events")
     sub = p.add_subparsers(dest="cmd")
@@ -63,6 +72,20 @@ def _parser() -> argparse.ArgumentParser:
     pull.add_argument("--all", action="store_true")
     pull.add_argument("--force", action="store_true")
     ags.add_parser("list", help="list agents")
+
+    tl = sub.add_parser("tool", help="tools as code: push, pull, diff (esql and index_search tools)")
+    tls = tl.add_subparsers(dest="action", required=True)
+    tpush = tls.add_parser("push", help="create or update a tool from a Markdown file")
+    tpush.add_argument("file")
+    tpush.add_argument("--dry-run", action="store_true", help="show the diff, change nothing")
+    tdiff = tls.add_parser("diff", help="show how a file differs from the tool on the cluster")
+    tdiff.add_argument("file")
+    tpull = tls.add_parser("pull", help="write custom tools on the cluster to Markdown files")
+    tpull.add_argument("tool_id", nargs="?")
+    tpull.add_argument("-o", "--out", default="tools")
+    tpull.add_argument("--all", action="store_true")
+    tpull.add_argument("--force", action="store_true")
+    tls.add_parser("list", help="list custom tools")
 
     sub.add_parser("agents", help="list agents")
     sub.add_parser("models", help="list chat models")
@@ -130,17 +153,59 @@ def _agent_cmd(cfg: Config, a: argparse.Namespace, ui: Ui) -> int:
     return 0
 
 
+def _tool_cmd(cfg: Config, a: argparse.Namespace, ui: Ui) -> int:
+    client = Elastic(cfg.get(a.cluster))
+    if a.space:
+        client.space = a.space
+    if a.action == "list":
+        rows, footer = toolcode.listing(client)
+        for tid, text in rows:
+            ui.console.print(f"[cyan]{tid}[/cyan]  [dim]{text}[/dim]", markup=True)
+        ui.info(footer)
+        return 0
+    if a.action in ("push", "diff"):
+        res = toolcode.push(client, a.file, confirm=lambda t, d: ui.confirm(t, d, allow_always=False) == "y",
+                            say=lambda m: ui.console.print(m, markup=False, highlight=False),
+                            dry_run=a.action == "diff" or a.dry_run)
+        ui.ok(f"{res['id']}: {res['action']}  [cluster {client.profile.name} · space {client.space}]")
+        return 0
+    if a.all:
+        paths = toolcode.pull_all(client, a.out, force=a.force)
+        ui.ok(f"pulled {len(paths)} tools into {a.out}/")
+    elif a.tool_id:
+        ui.ok(f"wrote {toolcode.pull(client, a.tool_id, a.out, force=a.force)}")
+    else:
+        raise ValueError("give a tool id, or --all")
+    return 0
+
+
+def _fail(ui: Ui, a: argparse.Namespace, msg: str, code: int) -> int:
+    ui.error(msg)
+    if a.json:  # a script asked for JSON: give it JSON on stdout, not just text on stderr
+        print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
-    a = _parser().parse_args(argv)
+    parser = _parser()
+    a = parser.parse_args(argv)
+    if a.json and a.prompt is None:
+        parser.error("--json needs -p PROMPT")
+    if (a.cont or a.resume) and a.cmd:
+        parser.error("-c and --resume continue a chat: use them without a subcommand")
     status = TabStatus()
     atexit.register(status.clear)  # never leave a stale "done" on the tab after we exit
-    ui = Ui(debug=a.debug, auto_yes=a.yes, status=status)
+    # --json: stdout carries only the JSON, so progress, notes and errors go to stderr and the answer text is held back
+    ui = Ui(console=Console(stderr=True, highlight=False) if a.json else None, debug=a.debug, auto_yes=a.yes,
+            status=status, silent_text=a.json)
     try:
         cfg = Config()
         if a.cmd in ("cluster", "profile"):
             return _cluster_cmd(cfg, a, ui)
         if a.cmd == "agent":
             return _agent_cmd(cfg, a, ui)
+        if a.cmd == "tool":
+            return _tool_cmd(cfg, a, ui)
         repl = Repl(cfg, ui, profile=a.cluster, agent=a.agent, model=a.model, mode=a.mode, space=a.space)
         if a.cmd == "agents":
             repl.cmd_agents("")
@@ -156,16 +221,21 @@ def main(argv: list[str] | None = None) -> int:
                 ui.ok(f"tool {res['tool']}" + (f" attached to {res['attached_to_agent']}" if res.get("attached_to_agent") else ""))
         elif a.prompt is not None:
             text = a.prompt if sys.stdin.isatty() else (a.prompt + "\n\n" + sys.stdin.read()).strip()
+            if a.cont or a.resume:
+                repl.resume_for_cli(a.resume, a.agent)
             repl.send(text)
+            if a.json:
+                print(json.dumps(repl.result(), ensure_ascii=False))
+            return 130 if repl.interrupted else (1 if repl.last_error else 0)  # a failed one-shot must not exit 0
         else:
+            if a.cont or a.resume:
+                repl.resume_for_cli(a.resume, a.agent)
             repl.run()
         return 0
     except (ConfigError, ValueError) as exc:
-        ui.error(str(exc))
-        return 2
+        return _fail(ui, a, str(exc), 2)
     except (ApiError, OSError, PermissionError) as exc:
-        ui.error(str(exc))
-        return 1
+        return _fail(ui, a, str(exc), 1)
     except KeyboardInterrupt:
         return 130
 

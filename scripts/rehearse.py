@@ -4,13 +4,14 @@
     python scripts/rehearse.py            # set up, run every check, leave objects in place
     python scripts/rehearse.py --cleanup  # remove everything this script created
 
-Creates only: agent eh-demo, tool eh-search-kestrel, index eh-local-kestrel, and the conversations
-it starts (ids are recorded in the state dir so cleanup is exact).
+Creates only: agents eh-demo and eh-code-demo, tools eh-search-kestrel and eh-tool-demo, index eh-local-kestrel,
+and the conversations it starts (ids are recorded in the state dir so cleanup is exact).
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import re
@@ -25,7 +26,8 @@ import dataclasses
 import os
 import subprocess
 
-from elastic_harness import agentcode, transcript
+import elastic_harness.cli as cli_mod
+from elastic_harness import agentcode, toolcode, transcript
 from elastic_harness.agent_chat import history_lines, run_turn
 from elastic_harness.client import ApiError, Elastic
 from elastic_harness.compare import run_compare
@@ -41,6 +43,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SAMPLE = ROOT / "examples" / "kestrel"
 AGENT, TOOL, INDEX = "eh-demo", "eh-search-kestrel", "eh-local-kestrel"
 CODE_AGENT = "eh-code-demo"
+TOOL_DEMO = "eh-tool-demo"  # the ES|QL tool the tools-as-code checks create
 STATE = STATE_DIR / "rehearse-state.json"
 
 
@@ -112,6 +115,7 @@ def cleanup(client: Elastic) -> None:
     for label, call in (("agent", lambda: client.kb("DELETE", f"/api/agent_builder/agents/{AGENT}")),
                         ("code agent", lambda: client.kb("DELETE", f"/api/agent_builder/agents/{CODE_AGENT}")),
                         ("tool", lambda: client.kb("DELETE", f"/api/agent_builder/tools/{TOOL}")),
+                        ("demo tool", lambda: client.kb("DELETE", f"/api/agent_builder/tools/{TOOL_DEMO}")),
                         ("index", lambda: client.es("DELETE", f"/{INDEX}"))):
         try:
             call()
@@ -486,6 +490,82 @@ def new_features(client: Elastic, s: dict, models: list[str], haiku: str, sonnet
         check("answered from the summary without re-reading files", not any(t in ("read_file", "grep") for t in ui.tools[-1:]), str(ui.tools[-3:]))
     finally:
         la.CONTEXT_TOKENS = old
+
+    print("\n17. tools as code: push, diff, pull, run, guards")
+    work = Path(tempfile.mkdtemp(prefix="eh-tools-"))
+    try:  # our own object from an earlier run: start clean so "create" really creates
+        client.kb("DELETE", f"/api/agent_builder/tools/{TOOL_DEMO}")
+    except ApiError:
+        pass
+    tf = work / f"{TOOL_DEMO}.md"
+    tf.write_text(f"---\nid: {TOOL_DEMO}\ntype: esql\ndescription: Kestrel note files that mention a word (rehearsal tool)\n"
+                  "tags: [elastic-harness]\nparams:\n  word:\n    type: string\n    description: Word to look for\n"
+                  "  limit:\n    type: integer\n    description: Most rows to return\n    optional: true\n    defaultValue: 3\n---\n"
+                  f"FROM {INDEX}\n| WHERE MATCH(content, ?word)\n| KEEP name\n| LIMIT ?limit\n")
+    said = []
+    res = toolcode.push(client, str(tf), confirm=lambda t, d: True, say=said.append, dry_run=True)
+    check("dry run changes nothing", res["action"] == "would create" and TOOL_DEMO not in [t["id"] for t in client.tools()], str(res))
+    res = toolcode.push(client, str(tf), confirm=lambda t, d: True, say=said.append)
+    made = client.tool(TOOL_DEMO) if res["action"] == "created" else {}
+    check("push created the tool with its params", (made.get("configuration") or {}).get("params", {}).get("limit", {}).get("defaultValue") == 3, str(res))
+    check("repeat push is unchanged", toolcode.push(client, str(tf), confirm=lambda t, d: True, say=said.append)["action"] == "unchanged")
+    rows = client.execute_tool(TOOL_DEMO, {"word": "Priya", "limit": 1}).get("results", [])
+    values = [r["data"]["values"] for r in rows if "values" in (r.get("data") or {})]
+    check("the pushed tool runs, with a parameter and the default", values and len(values[0]) == 1, str(rows)[:200])
+    tf.write_text(tf.read_text().replace("| KEEP name", "| KEEP name, path"))
+    said.clear()
+    res = toolcode.push(client, str(tf), confirm=lambda t, d: True, say=said.append)
+    check("editing the file shows a diff and updates the tool", res["action"] == "updated" and any("+| KEEP name, path" in m for m in said), str(res))
+    out_file = toolcode.pull(client, TOOL_DEMO, str(work / "pulled"))
+    check("a pulled file pushes back as unchanged", toolcode.push(client, str(out_file), confirm=lambda t, d: True, say=said.append)["action"] == "unchanged")
+    check("listing shows the tool", TOOL_DEMO in [r[0] for r in toolcode.listing(client)[0]])
+    declined = tf.read_text().replace("Most rows", "Fewest rows")
+    tf.write_text(declined)
+    check("declined confirmation changes nothing", toolcode.push(client, str(tf), confirm=lambda t, d: False, say=said.append)["action"] == "cancelled"
+          and "Most rows" in json.dumps(client.tool(TOOL_DEMO)))
+    other = work / "builtin.md"
+    other.write_text(declined.replace(f"id: {TOOL_DEMO}", "id: platform.core.search"))
+    try:
+        toolcode.push(client, str(other), confirm=lambda t, d: True, say=said.append)
+        check("a built-in tool is refused", False, "push went ahead")
+    except PermissionError:
+        check("a built-in tool is refused", True)
+
+    print("\n18. doctor checks, one-shot --json, and -c")
+    ui = Rec()
+    Repl(cfg, ui, profile=prof.name).cmd_doctor("")
+    seen = ui.console.file.getvalue()
+    check("doctor confirms the abort route", "Ctrl+C can stop agent runs" in seen, seen[-200:])
+    check("probe says present", client.probe_abort_route() == "present")
+    check("doctor is quiet about the version it was built on" if client.version().startswith("9.6") else "doctor flags a version it was not built on",
+          ("rehearsed on" not in seen) == client.version().startswith("9.6"), client.version())
+
+    def one_shot(*argv):
+        out, saved_cfg, saved_in = io.StringIO(), cli_mod.Config, sys.stdin
+        cli_mod.Config, sys.stdin = (lambda: cfg), io.StringIO("")  # the copied profile; an empty stdin so -p never waits on a pipe
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = cli_mod.main(["--cluster", prof.name, *argv])
+        finally:
+            cli_mod.Config, sys.stdin = saved_cfg, saved_in
+        return code, out.getvalue()
+
+    code, raw = one_shot("--agent", AGENT, "--model", "haiku 4.5", "-p", "Who owns Project Kestrel? One line.", "--json")
+    try:
+        first = json.loads(raw)
+    except ValueError:
+        first = {}
+    if first.get("conversation_id"):
+        s["conversations"].append(first["conversation_id"])
+        save_state(s)
+    check("-p --json prints one JSON object on stdout", code == 0 and first.get("ok") and has(first.get("answer", ""), "Priya"), raw[:200])
+    check("the JSON carries ids, usage and tools", first.get("conversation_id") and first.get("usage", {}).get("input_tokens", 0) > 0
+          and TOOL in first.get("tools", []), str({k: first.get(k) for k in ("usage", "tools")})[:200])
+    code, raw = one_shot("--agent", AGENT, "--model", "haiku 4.5", "-c", "-p", "And what is the budget? One line.", "--json")
+    second = json.loads(raw) if raw.strip().startswith("{") else {}
+    check("-c continues the latest conversation with that agent", second.get("conversation_id") == first.get("conversation_id") and code == 0, raw[:200])
+    code, raw = one_shot("--agent", "no-such-agent", "-p", "hi", "--json")
+    check("a failed one-shot exits non-zero with a JSON error", code == 2 and json.loads(raw).get("ok") is False, f"{code} {raw[:120]}")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from rich.table import Table
 
-from . import __version__, agentcode, clusters, transcript
+from . import __version__, agentcode, clusters, toolcode, transcript
 from .agent_chat import history_lines, run_turn, usage_line
 from .client import ApiError, Elastic
 from .compare import MAX_MODELS, render as render_compare, run_compare
@@ -31,6 +31,7 @@ COMMANDS = {
     "space": "/space <id>  switch Kibana space (agents are per space) · /spaces lists them",
     "agents": "list Agent Builder agents",
     "agent": "/agent <id>  switch · push|pull|diff <file>  agents as code",
+    "tool": "/tool push|pull|diff <file> · list  custom tools (esql, index_search) as code",
     "models": "list chat models on the cluster",
     "model": "/model <words>  switch model, e.g. /model sonnet 5.5 · /model default",
     "mode": "/mode agent|local  agent = an Elastic agent answers · local = the harness runs tools on this Mac",
@@ -53,8 +54,8 @@ COMMANDS = {
 }
 _PREFERRED = ["5.5-sonnet", "4.6-sonnet", "sonnet", "haiku"]
 # slash commands slow enough to deserve "working" on the tab (the quick ones would only flicker it)
-SLOW_COMMANDS = {"compare", "ingest", "compact", "doctor", "cluster", "agent", "resume", "space", "export", "agents", "models"}
-_PATH_CMDS = re.compile(r"^/(ingest|export|agent (?:push|pull|diff))\s+(\S*)$")
+SLOW_COMMANDS = {"compare", "ingest", "compact", "doctor", "cluster", "agent", "tool", "resume", "space", "export", "agents", "models"}
+_PATH_CMDS = re.compile(r"^/(ingest|export|(?:agent|tool) (?:push|pull|diff))\s+(\S*)$")
 
 
 def pick_default_model(models: list[str]) -> str:
@@ -92,6 +93,9 @@ class Repl:
         self.local: LocalSession | None = None
         self.tokens = [0, 0]  # agent-mode in / out
         self.last_prompt: str | None = None
+        self.last_error: str | None = None  # set when the last send failed: `eh -p` turns it into an exit code
+        self.interrupted = False
+        self.last_result: dict = {}  # conversation id, usage and tools of the last send: `eh -p --json` prints it
         self.connect(profile)
         self.reload_project()
         if space:
@@ -176,6 +180,7 @@ class Repl:
             self.ui.line(f"[{colour}]@ {n['path']} · {n['status']}" + (f" · {n['chars']:,} chars" if n["chars"] else "") + f"[/{colour}]")
         st = self.ui.status
         st.set("working", self.last_prompt or text)
+        self.last_error, self.interrupted, self.last_result = None, False, {}
         try:
             self.ui.last_answer = ""
             if self.mode == "local":
@@ -186,9 +191,11 @@ class Repl:
         except KeyboardInterrupt:
             self.ui.flush()
             self.ui.warn("interrupted")
+            self.interrupted, self.last_error = True, "interrupted"
             st.set("idle", "interrupted")
         except ApiError as exc:
             self.ui.error(str(exc))
+            self.last_error = str(exc)
             st.set("error", str(exc))
 
     def _send_agent(self, text: str) -> None:
@@ -198,10 +205,24 @@ class Repl:
         res = run_turn(self.client, self.ui, agent_id=self.agent_id, text=text,
                        conversation_id=self.conversation_id, model=self.model or None)
         self.conversation_id = res["conversation_id"]
+        self.last_result = {"usage": res["usage"] or {}, "tools": res["tools"]}
         if res["usage"]:
             self.tokens[0] += res["usage"].get("input_tokens", 0)
             self.tokens[1] += res["usage"].get("output_tokens", 0)
             self.ui.usage(usage_line(res["usage"]))
+
+    def result(self) -> dict:
+        """The outcome of the last send as one JSON-able dict (`eh -p --json`)."""
+        local = self.mode == "local"
+        out = {"ok": self.last_error is None, "cluster": self.raw.name, "space": self.client.space, "mode": self.mode,
+               "agent": None if local else self.agent_id, "model": self.model or None,
+               "conversation_id": (self.local.id if self.local else None) if local else self.conversation_id,
+               "answer": self.ui.last_answer, "usage": self.last_result.get("usage") or {}}
+        if "tools" in self.last_result:
+            out["tools"] = self.last_result["tools"]
+        if self.last_error:
+            out["error"] = self.last_error
+        return out
 
     def _ensure_local(self) -> bool:
         if not self.model:
@@ -220,6 +241,7 @@ class Repl:
         if not self._ensure_local():
             return
         self.local.turn(text)
+        self.last_result = {"usage": {"input_tokens": self.local.tokens_in, "output_tokens": self.local.tokens_out}}
         self.ui.usage(f"{self.local.tokens_in:,} in / {self.local.tokens_out:,} out tokens this session · {self.model}")
 
     # -- commands ---------------------------------------------------------------------------
@@ -444,6 +466,42 @@ class Repl:
             else:
                 self.ui.info("usage: /agent pull <id> [dir] [--force]  or  /agent pull --all [dir]")
 
+    def cmd_tool(self, arg: str) -> None:
+        argv = shlex.split(arg)
+        if not argv or argv[0] not in ("push", "pull", "diff", "list"):
+            return self.ui.info("usage: /tool push|diff <file.md> · /tool pull <id> [dir] · /tool pull --all [dir] · /tool list")
+        sub = argv[0]
+
+        def build(ap):
+            ap.add_argument("target", nargs="?")
+            ap.add_argument("out", nargs="?", default="tools")
+            ap.add_argument("--all", action="store_true")
+            ap.add_argument("--force", action="store_true")
+            ap.add_argument("--dry-run", action="store_true")
+        a = _flags(argv[1:], build)
+        if sub == "list":
+            return self.print_custom_tools()
+        if sub in ("push", "diff"):
+            if not a.target:
+                return self.ui.info(f"usage: /tool {sub} <file.md>")
+            res = toolcode.push(self.client, a.target, confirm=lambda t, d: self.ui.confirm(t, d, allow_always=False) == "y",
+                                say=lambda m: self.ui.console.print(m, markup=False, highlight=False),
+                                dry_run=a.dry_run or sub == "diff")
+            self.ui.ok(f"{res['id']}: {res['action']}")
+        elif a.all:
+            paths = toolcode.pull_all(self.client, a.target or "tools", force=a.force)
+            self.ui.ok(f"pulled {len(paths)} tools into {Path(a.target or 'tools')}/")
+        elif a.target:
+            self.ui.ok(f"wrote {toolcode.pull(self.client, a.target, a.out, force=a.force)}")
+        else:
+            self.ui.info("usage: /tool pull <id> [dir] [--force]  or  /tool pull --all [dir]")
+
+    def print_custom_tools(self) -> None:
+        rows, footer = toolcode.listing(self.client)
+        for tid, text in rows:
+            self.ui.console.print(f"[cyan]{tid}[/cyan]  [dim]{text}[/dim]", markup=True)
+        self.ui.info(footer)
+
     def cmd_models(self, arg: str) -> None:
         self.models_cache = None
         for m in self.models():
@@ -568,22 +626,48 @@ class Repl:
                     self.ui.console.print(f"[cyan]{i:>2}[/cyan] {s['saved'][:16]}  {s['first']}")
                 return self.ui.info("/resume <n> to reopen") if saved else self.ui.info("no saved local sessions")
             sid = saved[int(arg) - 1]["id"] if arg.isdigit() and int(arg) <= len(saved) else arg
-            self.local = LocalSession(Ctx(self.client, self.ui, self.cwd, self.model, self.always), self.agents(), sid,
-                                      extra_system=self.context)
-            self.ui.ok(f"resumed {sid} ({self.local.load(sid)} messages)")
-            return
+            return self._resume_local(sid)
         convs = sorted(self.client.conversations(), key=lambda c: c.get("updated_at", ""), reverse=True)[:15]
         if not arg:
             for i, c in enumerate(convs, 1):
                 self.ui.console.print(f"[cyan]{i:>2}[/cyan] {c.get('updated_at', '')[:16]}  [dim]{c.get('agent_id', '')}[/dim]  {short(c.get('title', ''), 60)}")
             return self.ui.info("/resume <n> to reopen") if convs else self.ui.info("no conversations yet")
-        conv_id = convs[int(arg) - 1]["id"] if arg.isdigit() and int(arg) <= len(convs) else arg
+        self._resume_agent(convs[int(arg) - 1]["id"] if arg.isdigit() and int(arg) <= len(convs) else arg)
+
+    def _resume_local(self, sid: str) -> None:
+        self.local = LocalSession(Ctx(self.client, self.ui, self.cwd, self.model, self.always), self.agents(), sid,
+                                  extra_system=self.context)
+        self.ui.ok(f"resumed {sid} ({self.local.load(sid)} messages)")
+
+    def _resume_agent(self, conv_id: str, show_history: bool = True) -> None:
         conv = self.client.conversation(conv_id)
         self.conversation_id = conv_id
         self.agent_id = conv.get("agent_id") or self.agent_id
         self.ui.ok(f"resumed '{short(conv.get('title', ''), 60)}' with agent {self.agent_id}")
-        for role, text in history_lines(conv):
-            self.ui.line(f"[bold]{role}[/bold] [dim]{short(text, 160)}[/dim]")
+        if show_history:
+            for role, text in history_lines(conv):
+                self.ui.line(f"[bold]{role}[/bold] [dim]{short(text, 160)}[/dim]")
+
+    def resume_for_cli(self, conv_id: str | None, agent: str | None = None) -> None:
+        """`eh -c` / `eh --resume ID`: reopen a conversation before the first prompt, without echoing its history.
+
+        No id means the most recent one (with `agent`, the most recent one with that agent). Raises ConfigError if
+        there is nothing to continue.
+        """
+        if self.mode == "local":
+            saved = LocalSession.list_saved()
+            if not conv_id and not saved:
+                raise ConfigError("no saved local sessions to continue")
+            return self._resume_local(conv_id or saved[0]["id"])  # session ids start with a timestamp: newest first
+        if not conv_id:
+            convs = sorted(self.client.conversations(), key=lambda c: c.get("updated_at", ""), reverse=True)
+            if agent:
+                convs = [c for c in convs if c.get("agent_id") == agent]
+            if not convs:
+                raise ConfigError("no earlier conversation to continue" + (f" with agent {agent}" if agent else "")
+                                  + f" on cluster {self.raw.name}, space {self.client.space}")
+            conv_id = convs[0]["id"]
+        self._resume_agent(conv_id, show_history=False)
 
     def cmd_ingest(self, arg: str) -> None:
         argv = shlex.split(arg)
@@ -624,13 +708,16 @@ class Repl:
                      (f" · local mode: {self.local.tokens_in:,} in / {self.local.tokens_out:,} out" if self.local else ""))
 
     def cmd_doctor(self, arg: str) -> None:
-        self.ui.ok(f"cluster {self.raw.name} · Kibana {self.client.version()} · space {self.client.space} · {clusters.host(self.client.kibana_url)}")
+        version = self.client.version()
+        self.ui.ok(f"cluster {self.raw.name} · Kibana {version} · space {self.client.space} · {clusters.host(self.client.kibana_url)}")
         try:
             who = self.client.whoami()
             self.ui.ok(f"authenticated as {who.get('username')} (realm {(who.get('authentication_realm') or {}).get('type')}) · key in {Config.key_source(self.raw)}")
         except ApiError as exc:
             self.ui.warn(f"Elasticsearch: {exc}")
         self.ui.ok(f"{len(self.agents())} agents · {len(self.models())} chat models")
+        for level, msg in clusters.compat_notes(version, self.client.probe_abort_route()):
+            {"ok": self.ui.ok, "warn": self.ui.warn}.get(level, self.ui.info)(msg)
         self.ui.info(f"agent {self.agent_id} · model {self.model or 'cluster default'} · mode {self.mode}")
 
     def cmd_tabstatus(self, arg: str) -> None:
@@ -708,6 +795,7 @@ class Repl:
                             yield Completion(k, -len(cmd), display=f"/{k}", display_meta=meta[:50])
                     return
                 pool = {"agent": [a["id"] for a in repl.agents_cache or []] + ["push", "pull", "diff"],
+                        "tool": ["push", "pull", "diff", "list"],
                         "model": repl.models_cache or [], "mode": ["agent", "local"],
                         "cluster": list(repl.config.profiles) + ["add", "rm", "test", "secure"],
                         "profile": list(repl.config.profiles)}.get(cmd, [])

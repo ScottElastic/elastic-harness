@@ -4,17 +4,21 @@ A terminal harness for Elastic Agent Builder (`eh`). Python 3.10+, runtime deps 
 the HTTP and SSE client is stdlib. Read `README.md` for usage and `docs/ARCHITECTURE.md` for verified API facts.
 
 ## Run
-- `.venv/bin/python -m unittest discover -s tests` (71 tests, offline, no cluster)
+- `.venv/bin/python -m unittest discover -s tests` (100 tests, offline, no cluster)
 - `.venv/bin/python scripts/rehearse.py` (live, uses the active profile) and `--cleanup` afterwards
 - `.venv/bin/python scripts/iterm_check.py` (needs iTerm2 3.7+; opens and force-closes a throwaway window)
 - `./install.sh` to (re)install and link `~/.local/bin/eh`
+- CI (`.github/workflows/tests.yml`) runs the offline suite on Python 3.10 to 3.13 (Linux) and 3.12 (macOS). Keep tests free of a
+  real cluster, Keychain and terminal, and the code free of post-3.10 syntax or stdlib. Linux has no `keyring`.
+- Scripting `eh -p` (or `rehearse.py`): redirect stdin (`</dev/null`). With stdin not a terminal, `-p` reads it to the end, so an
+  open pipe makes it wait forever.
 
 ## Rules
 - Never commit or print credentials. `config.json`, `*.local.json`, `.env*` are gitignored. A profile's `creds_file`
   is read in place; `Config.save` never writes a key that came from a creds file.
 - Anything the model can read goes through `guard.is_secret_path`. Tools that change the machine or hand work to an
   agent must set `describe` so `run_tool` asks first.
-- Only touch objects this tool created: indices `eh-local-*`, tools `eh-search-*`, the `eh-demo` and `eh-code-demo` rehearsal agents.
+- Only touch objects this tool created: indices `eh-local-*`, tools `eh-search-*` and `eh-tool-demo`, the `eh-demo` and `eh-code-demo` rehearsal agents.
 - Verify API behaviour on a live cluster before relying on Kibana source or docs; record what you verified with a
   version in `docs/ARCHITECTURE.md`.
 - Mode and space are session-only; agent and model choices persist per cluster.

@@ -60,7 +60,8 @@ class FakeElastic:
         return [{"id": "c-old", "title": "old chat", "agent_id": "eh-demo", "updated_at": "2026-11-01T00:00:00Z"}]
 
     def conversation(self, cid):
-        return {"id": cid, "title": "t", "agent_id": "eh-demo", "rounds": [
+        agent = next((c.get("agent_id") for c in self.conversations() if c["id"] == cid), "eh-demo")
+        return {"id": cid, "title": "t", "agent_id": agent, "rounds": [
             {"input": {"message": "hi"}, "response": {"message": "hello there"},
              "steps": [{"type": "tool_call", "tool_id": "eh-search", "params": {"q": "x"}}],
              "model_usage": {"input_tokens": 10, "output_tokens": 5, "connector_id": "m"}}]}
@@ -88,8 +89,18 @@ class FakeElastic:
         return True
 
     def tools(self):
-        return [{"id": "eh-search", "type": "index_search"}, {"id": "platform.core.search", "type": "builtin"},
-                {"id": "platform.core.resume_workflow_execution", "type": "builtin"}]
+        return [{"id": "eh-search", "type": "index_search", "readonly": False}, {"id": "platform.core.search", "type": "builtin", "readonly": True},
+                {"id": "platform.core.resume_workflow_execution", "type": "builtin", "readonly": True}, *getattr(self, "stored_tools", {}).values()]
+
+    def tool(self, tool_id):
+        if tool_id in getattr(self, "stored_tools", {}):
+            return self.stored_tools[tool_id]
+        raise ApiError(404, "not found")
+
+    abort_route = "present"
+
+    def probe_abort_route(self, timeout=15):
+        return self.abort_route
 
     def agent(self, agent_id):
         if agent_id in getattr(self, "stored_agents", {}):

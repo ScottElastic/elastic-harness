@@ -61,6 +61,19 @@ def _error_message(body: str) -> str:
     return str(d)[:400]
 
 
+def classify_abort_probe(status: int, body: str) -> str:
+    """Read the answer to a probe of the abort route (see Elastic.probe_abort_route)."""
+    try:
+        data = json.loads(body, strict=False)
+    except ValueError:
+        data = None
+    if status == 200 and isinstance(data, dict) and "acknowledged" in data:
+        return "present"
+    if status == 404 and isinstance(data, dict) and data.get("message") == "Not Found":
+        return "missing"  # Kibana's generic route-not-found; a handler's own 404 would say something else
+    return "unknown"
+
+
 class Elastic:
     def __init__(self, profile: Profile, timeout: int = 60):
         p = profile.resolved()
@@ -150,6 +163,24 @@ class Elastic:
         except (urllib.error.URLError, ValueError, OSError):
             return False
 
+    def probe_abort_route(self, timeout: int = 15) -> str:
+        """Is Kibana's internal abort route there? 'present', 'missing' or 'unknown'.
+
+        Posts to it with a random execution id. Nothing is running under that id, so nothing is stopped: a Kibana that
+        has the route answers 200 {"acknowledged": false}, one that has not answers its generic 404 (verified 9.6.0).
+        """
+        url = self.kb_url(f"/internal/agent_builder/executions/{uuid.uuid4()}/abort?wait_for_terminal=false")
+        h = self._headers(True, {"Elastic-Api-Version": "1", "x-elastic-internal-origin": "kibana"})
+        try:
+            req = urllib.request.Request(url, data=b"", headers=h, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                status, body = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            status, body = exc.code, exc.read().decode("utf-8", "replace")
+        except (urllib.error.URLError, OSError, ValueError):
+            return "unknown"
+        return classify_abort_probe(status, body)
+
     # -- Agent Builder ----------------------------------------------------------------------
     def agents(self) -> list[dict]:
         return self.kb("GET", "/api/agent_builder/agents").get("results", [])
@@ -159,6 +190,9 @@ class Elastic:
 
     def tools(self) -> list[dict]:
         return self.kb("GET", "/api/agent_builder/tools").get("results", [])
+
+    def tool(self, tool_id: str) -> dict:
+        return self.kb("GET", f"/api/agent_builder/tools/{tool_id}")
 
     def execute_tool(self, tool_id: str, params: dict) -> dict:
         return self.kb("POST", "/api/agent_builder/tools/_execute", {"tool_id": tool_id, "tool_params": params}, timeout=120)

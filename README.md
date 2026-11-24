@@ -28,9 +28,11 @@ Python 3.10+ and a Mac or Linux shell.
 ```bash
 ./install.sh                                              # .venv, install, link ~/.local/bin/eh
 eh cluster add my-cluster --creds ~/path/to/creds.local.json   # or: eh cluster add my-cluster  (prompts, key goes to the Keychain)
-eh doctor                                                 # connection, identity, agents, models
+eh doctor                                                 # connection, identity, agents, models, Kibana version, abort route
 eh                                                        # start chatting
 ```
+
+No clone: `pipx install git+https://github.com/ScottElastic/elastic-harness.git` (or the same URL with `pip install`) gives you the `eh` command.
 
 ## Clusters and credentials
 
@@ -53,8 +55,8 @@ file `~/.config/elastic-harness/config.json`, used only where there is no Keycha
 that lives in the Keychain or a creds file. The first Keychain access may show a macOS prompt: choose Always Allow.
 
 **API key privileges** (from the Elastic docs; tested with a full-access key only): Kibana
-`feature_agentBuilder.read` to chat; `manage_agents` and `manage_tools` for `/ingest --tool --agent` and
-`eh agent push`; cluster `monitor_inference` for model calls; `read` on indices you query or `@index:`; and
+`feature_agentBuilder.read` to chat; `manage_agents` and `manage_tools` for `/ingest --tool --agent`,
+`eh agent push` and `eh tool push`; cluster `monitor_inference` for model calls; `read` on indices you query or `@index:`; and
 `create_index`, `write`, `delete` on `eh-local-*` for `/ingest`. `@alert` and `@case` need the Security alert and case
 privileges in that space. `/spaces` needs permission to list spaces (otherwise `/space <id>` still works).
 
@@ -79,6 +81,7 @@ privileges in that space. `/spaces` needs permission to list spaces (otherwise `
 |---|---|
 | `/space <id>`, `/spaces` | Switch Kibana space (agents are per space). Your chosen agent returns as soon as a space has it |
 | `/agent <id>`, `/agents` | Switch agent (new conversation) |
+| `/tool push\|pull\|diff <file>`, `/tool list` | Custom tools as code (see *Tools as code*) |
 | `/model sonnet 5.5`, `/models` | Match by words against the cluster's chat endpoints. `/model default` = the cluster default |
 | `/compare sonnet 5.5 \| haiku 4.5 :: prompt` | Same prompt on 2 to 4 models, side by side, with time and tokens. Agent mode runs the real agent once per model; local mode compares plain answers. No `::` = your last prompt. The throwaway chats are deleted |
 | `/retry`, `/retry --keep` | Re-run your last prompt on a fresh conversation (or continue this one) |
@@ -134,6 +137,70 @@ eh agent push agents/my-agent.md      # shows the diff, asks, then creates or up
 Also `/agent push|pull|diff` inside a session. Push targets the current **cluster and space** and says so. It refuses
 unknown tool ids, built-in agents, and tools that can run or approve workflows
 (`resume_workflow_execution`, `execute_workflow`, connector sub-actions) unless you pass `--allow-risky`.
+
+## Tools as code
+
+The same idea for the tools an agent calls: one Markdown file per **custom** tool. An `esql` tool's body is its query,
+and each `?name` in it is a parameter you declare under `params:`.
+
+```markdown
+---
+id: kestrel-notes-by-word
+type: esql
+description: Kestrel note files that mention a word
+tags: [kestrel, demo]
+params:
+  word:
+    type: string                   # string | integer | float | boolean | date | array
+    description: The word to look for
+  limit:
+    type: integer
+    description: Most rows to return
+    optional: true
+    defaultValue: 3
+---
+FROM eh-local-kestrel
+| WHERE MATCH(content, ?word)
+| KEEP name
+| LIMIT ?limit
+```
+
+An `index_search` tool has no query: it names the index it searches (`pattern: eh-local-kestrel`) and its body is empty.
+
+```bash
+eh tool list                          # your custom tools (built-ins are counted, not listed)
+eh tool pull --all -o tools/          # or: eh tool pull my-tool -o tools/
+eh tool diff tools/my-tool.md         # what would change on the cluster
+eh tool push tools/my-tool.md         # shows the diff, asks, then creates or updates (--yes, --dry-run)
+```
+
+Also `/tool push|pull|diff|list` inside a session. Give an agent the tool by listing its id under `tools:` in the agent's
+file, then `eh agent push`. Before anything is sent, `push` checks the id (lowercase letters, digits, `.`, `_`, `-`), that
+every `?name` in the query is declared, and that each param has a valid type. It refuses built-in tools and will not change
+a tool's type (Kibana does not allow that). Like `eh agent push` it targets the current **cluster and space** and says so.
+Only `esql` and `index_search` tools are handled; workflow, MCP and built-in tools are left alone.
+
+## One-shot runs and scripting
+
+```bash
+eh -p "Who owns Project Kestrel?" --agent eh-demo     # run one prompt, print the answer, exit
+cat alert.txt | eh -p "Triage this"                   # piped text is added to the prompt
+eh -c -p "And its go-live date?"                      # continue the most recent conversation
+eh -p "Summarise my open cases" --json | jq -r .answer
+```
+
+`-c` / `--continue` continues the most recent conversation, or with `--agent X` the most recent one with that agent.
+`--resume ID` continues a specific one (in local mode, a saved session id). Both also work without `-p`, to start the
+interactive session in that conversation.
+
+`--json` prints one object: `ok`, `answer` (the final text block), `conversation_id`, `agent`, `model`, `mode`, `cluster`,
+`space`, `usage`, `tools` (agent mode: the tools the agent called) and, when `ok` is false, `error`. Everything else (the
+usage line, notes, errors) goes to stderr, so stdout is always one JSON line. Exit codes: `0` done, `1` the request failed,
+`2` bad setup or arguments (unknown agent, nothing to continue), `130` interrupted. Confirmations are denied in a
+non-interactive run unless you pass `--yes`.
+
+When stdin is not a terminal, `-p` appends it to the prompt and waits for it to end. From a script whose stdin is an
+open pipe that never closes, pass `</dev/null`.
 
 ## Project instructions and custom commands
 
@@ -204,10 +271,10 @@ retry. The summariser is told to keep every concrete fact and not to speculate.
 ## Verify it
 
 ```bash
-.venv/bin/python -m unittest discover -s tests      # 71 offline tests (fake Elastic client, fake Keychain, fake model, fake terminal)
-.venv/bin/python scripts/rehearse.py                # 65 live checks against the active cluster
+.venv/bin/python -m unittest discover -s tests      # 100 offline tests (fake Elastic client, fake Keychain, fake model, fake terminal)
+.venv/bin/python scripts/rehearse.py                # 81 live checks against the active cluster
 .venv/bin/python scripts/iterm_check.py             # 11 checks inside a real iTerm2 session (opens a throwaway window)
-.venv/bin/python scripts/rehearse.py --cleanup      # removes eh-demo, eh-code-demo, eh-search-kestrel, eh-local-kestrel, test chats
+.venv/bin/python scripts/rehearse.py --cleanup      # removes eh-demo, eh-code-demo, eh-search-kestrel, eh-tool-demo, eh-local-kestrel, test chats
 ```
 
 The rehearsal copies your active cluster into a temp config, so it never edits your real settings. It creates the
@@ -226,6 +293,8 @@ above against the live cluster, including a real Keychain round trip with a dumm
   back to the mode-600 config file.
 - Local mode's file tools are plain Python, not sandboxed: treat `bash` like a terminal you handed to an assistant.
 - `/ingest` handles text files only and uses lexical search, no embeddings.
+- Tools as code was verified on 9.6.0 for `esql` and `index_search` tools. A tool's `confirmation` setting is not part of the
+  file: `eh tool push` does not set it and `eh tool pull` does not record it.
 - Automatic compaction uses a token *estimate* (characters ÷ 3.5), not the model's own count.
 
 ## License

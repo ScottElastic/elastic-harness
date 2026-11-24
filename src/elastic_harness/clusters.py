@@ -13,6 +13,31 @@ from .client import Elastic
 from .config import Config, ConfigError, Profile
 
 _NAME = re.compile(r"^[A-Za-z0-9][\w.\-]{0,40}$")
+VERIFIED_KIBANA = (9, 6)  # the Kibana minor this build was rehearsed against (docs/ARCHITECTURE.md)
+
+
+def compat_notes(version: str, abort: str) -> list[tuple[str, str]]:
+    """What `eh doctor` says about this cluster's version and the one internal route we depend on.
+
+    Returns (level, message) pairs, level being "ok", "warn" or "info". `abort` is Elastic.probe_abort_route().
+    """
+    notes: list[tuple[str, str]] = []
+    m = re.match(r"^(\d+)\.(\d+)", version or "")
+    want = ".".join(map(str, VERIFIED_KIBANA))
+    if not m:
+        notes.append(("info", f"could not read the Kibana version ({version!r}); this build was rehearsed on {want}"))
+    elif (int(m.group(1)), int(m.group(2))) != VERIFIED_KIBANA:
+        notes.append(("warn", f"Kibana {version}: this build was rehearsed on {want}. The internal abort route and the /open "
+                              f"links are the parts most likely to differ; the rest uses public APIs"))
+    if abort == "present":
+        notes.append(("ok", "Ctrl+C can stop agent runs (Kibana's abort route is there)"))
+    elif abort == "missing":
+        notes.append(("warn", "Kibana's internal abort route is missing on this version: Ctrl+C stops the display, but an agent "
+                              "run keeps going on the server and spending tokens (see docs/ARCHITECTURE.md)"))
+    else:
+        notes.append(("warn", "could not confirm Kibana's abort route (the key may lack access, or the check failed): "
+                              "Ctrl+C may not stop a running agent"))
+    return notes
 
 
 def host(url: str) -> str:
