@@ -5,6 +5,7 @@ No third-party HTTP dependency: urllib plus a Server-Sent Events parser.
 
 from __future__ import annotations
 
+import copy
 import json
 import urllib.error
 import urllib.request
@@ -138,6 +139,38 @@ class Elastic:
                       {"query": {"ids": {"values": [alert_id]}}, "size": 1})
         hits = (res.get("hits") or {}).get("hits") or []
         return hits[0] if hits else None
+
+    def in_space(self, space: str) -> "Elastic":
+        """A copy of this client pointed at another space. A background thread uses one, so it can never change the
+        space the live session is working in."""
+        other = copy.copy(self)
+        other.space = space
+        return other
+
+    # What a picker lists. Both verified on 9.6.0 (read-only): about 0.4 s each.
+    _OPEN_ALERTS = {"term": {"kibana.alert.workflow_status": "open"}}
+
+    def open_alerts(self, limit: int = 20) -> list[dict]:
+        """The newest open detection alerts in this space: hits carrying only the fields a picker row shows."""
+        res = self.kb("POST", "/api/detection_engine/signals/search", {
+            "query": self._OPEN_ALERTS, "sort": [{"@timestamp": "desc"}], "size": limit,
+            "_source": ["kibana.alert.rule.name", "kibana.alert.severity", "host.name", "user.name", "@timestamp"]})
+        return (res.get("hits") or {}).get("hits") or []
+
+    def open_cases(self, limit: int = 20) -> list[dict]:
+        """The most recently created cases in this space that are not closed (open or in progress), newest first."""
+        res = self.kb("GET", f"/api/cases/_find?status=open&status=in-progress&perPage={int(limit)}"
+                             f"&sortField=createdAt&sortOrder=desc")
+        return [c for c in res.get("cases", []) if c.get("status") != "closed"]
+
+    def count_open(self, kind: str) -> int:
+        """How many open alerts, or open and in-progress cases, this space has."""
+        if kind == "alert":
+            res = self.kb("POST", "/api/detection_engine/signals/search",
+                          {"query": self._OPEN_ALERTS, "size": 0, "track_total_hits": True})
+            total = (res.get("hits") or {}).get("total") or 0
+            return int(total.get("value", 0) if isinstance(total, dict) else total)
+        return int(self.kb("GET", "/api/cases/_find?status=open&status=in-progress&perPage=1").get("total") or 0)
 
     def case(self, case_id: str) -> dict:
         return self.kb("GET", f"/api/cases/{case_id}")

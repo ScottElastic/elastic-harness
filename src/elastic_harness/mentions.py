@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import re
 
+from pathlib import Path
+
 from .client import ApiError, Elastic
+from .guard import attach_blocks, gather_files, neutralize
 
 _ELASTIC = re.compile(r"(?<![\w@/.])@(alert|case|index):([\w.\-*,:/]+[\w*])")
 MAX_BLOCK = 7000
@@ -61,7 +64,7 @@ def format_alert(alert_id: str, hit: dict) -> str:
     body = "\n".join(lines)
     if len(body) > MAX_BLOCK:
         body = body[:MAX_BLOCK] + "\n… [truncated]"
-    return f'<elastic_alert id="{alert_id}" index="{hit.get("_index", "")}">\n{body}\n</elastic_alert>'
+    return f'<elastic_alert id="{alert_id}" index="{hit.get("_index", "")}">\n{neutralize(body)}\n</elastic_alert>'
 
 
 def format_case(case: dict, comments: list[dict], alert_ids: list[str]) -> str:
@@ -75,7 +78,7 @@ def format_case(case: dict, comments: list[dict], alert_ids: list[str]) -> str:
     if alert_ids:
         head.append("alert ids: " + ", ".join(alert_ids[:20]) + "  (use @alert:<id> to pull one in)")
     body = "\n".join(head)
-    return f'<elastic_case id="{case.get("id")}">\n{body[:MAX_BLOCK]}\n</elastic_case>'
+    return f'<elastic_case id="{case.get("id")}">\n{neutralize(body[:MAX_BLOCK])}\n</elastic_case>'
 
 
 def format_index(pattern: str, res: dict) -> str:
@@ -87,11 +90,28 @@ def format_index(pattern: str, res: dict) -> str:
         samples.append(json.dumps({c["name"]: v for c, v in zip(cols, r) if v not in (None, [], "")},
                                   ensure_ascii=False, default=str)[:1500])
     body = f"fields ({len(cols)}): {schema[:2500]}\nsample documents ({len(samples)}):\n" + "\n".join(samples)
-    return f'<elastic_index pattern="{pattern}">\n{body[:MAX_BLOCK]}\n</elastic_index>'
+    return f'<elastic_index pattern="{pattern}">\n{neutralize(body[:MAX_BLOCK])}\n</elastic_index>'
 
 
 def expand_elastic_mentions(text: str, client: Elastic) -> tuple[str, list[dict]]:
     """Replace @alert:/@case:/@index: tokens with plain words and append the fetched objects as XML-ish blocks."""
+    clean, blocks, notes = gather_elastic(text, client)
+    return attach_blocks(clean, blocks), notes
+
+
+def expand_all(text: str, client: Elastic, cwd: Path | None = None) -> tuple[str, list[dict], list[dict]]:
+    """Every @mention in what the user typed: (message to send, Elastic notes, file notes).
+
+    ``@path`` mentions are looked for in the user's own words only. Alert and case text is attacker-influenced, and
+    scanning it too would let a field like ``@~/notes.md`` pull a local file into the prompt.
+    """
+    clean, eblocks, enotes = gather_elastic(text, client)
+    fblocks, notes = gather_files(clean, cwd, len(clean) + sum(len(b) for b in eblocks))
+    return attach_blocks(clean, eblocks + fblocks), enotes, notes
+
+
+def gather_elastic(text: str, client: Elastic) -> tuple[str, list[str], list[dict]]:
+    """(the user's text with the @alert:/@case:/@index: markers made plain, the fetched blocks, a note for each)."""
     notes: list[dict] = []
     blocks: list[str] = []
     seen: set[tuple[str, str]] = set()
@@ -119,6 +139,4 @@ def expand_elastic_mentions(text: str, client: Elastic) -> tuple[str, list[dict]
     for m in _ELASTIC.finditer(text):
         fetch(m.group(1), m.group(2))
     text = _ELASTIC.sub(lambda m: f"{m.group(1)} {m.group(2)}", text)  # keep the sentence readable, drop the '@'
-    if blocks:
-        text = text + "\n\n" + "\n\n".join(blocks)
-    return text, notes
+    return text, blocks, notes

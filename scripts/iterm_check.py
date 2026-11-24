@@ -6,7 +6,8 @@
 
 Needs iTerm2 3.7+ with the Python API enabled and its `it2` tool (~/.config/iterm2/it2). Uses a live cluster
 profile like scripts/rehearse.py: agent `eh-demo` must exist (run rehearse.py first). It never touches your
-other tabs; it only reads the status of the session it created.
+other tabs; it only reads the status and screen of the session it created. Section 3 (the @alert:/@case: pickers)
+needs a space with open alerts and cases and skips itself where there is none.
 """
 
 from __future__ import annotations
@@ -59,6 +60,46 @@ def watch(sid: str, until, timeout: float = 90, label: str = "") -> list[dict]:
 
 def states(seen: list[dict]) -> list:
     return [s.get("status") for s in seen]
+
+
+def screen_text(sid: str) -> str:
+    return it2("session", "read", "--session", sid)
+
+
+def wait_screen(sid: str, needles: list[str], timeout: float = 10) -> tuple[bool, str]:
+    """Poll the visible screen until every needle is on it (the dropdown is drawn after a background fetch)."""
+    t0, screen = time.time(), ""
+    while time.time() - t0 < timeout:
+        screen = screen_text(sid)
+        if all(n in screen for n in needles):
+            return True, screen
+        time.sleep(0.5)
+    return False, screen
+
+
+def picker_data() -> dict | None:
+    """Find, through the API, what the dropdowns should show: a space with open alerts and cases, and an empty one."""
+    sys.path.insert(0, str(ROOT / "src"))
+    try:
+        from elastic_harness import pickers
+        from elastic_harness.client import ApiError, Elastic
+        from elastic_harness.config import Config
+        client = Elastic(Config().get(None))
+        found, empty = None, None
+        for sp in [x["id"] for x in client.spaces()]:
+            c = client.in_space(sp)
+            try:
+                alerts, cases = c.open_alerts(pickers.LIMIT), c.open_cases(pickers.LIMIT)
+            except ApiError:
+                continue
+            if alerts and cases and not found:
+                found = (sp, [pickers.alert_row(a) for a in alerts], [pickers.case_row(x) for x in cases])
+            elif not alerts and not empty:
+                empty = sp
+        return {"space": found[0], "alerts": found[1], "cases": found[2], "empty": empty} if found else None
+    except Exception as exc:  # noqa: BLE001 - a diagnostic: say why and skip
+        print(f"       (could not look up picker data: {exc})")
+        return None
 
 
 def main() -> int:
@@ -119,6 +160,51 @@ def main() -> int:
         it2("session", "run", "--session", sid, "/exit")
         gone = watch(sid, lambda s: not s.get("status"), timeout=15, label="clear")
         check("cleared on /exit", not gone[-1].get("status"), str(gone[-1]))
+
+        print("\n3. @alert: and @case: pickers: type into a real prompt and read the dropdown back off the screen")
+        data = picker_data()
+        if not data:
+            print("       (no space with open alerts and cases: skipped)")
+        else:
+            sp, alerts, cases = data["space"], data["alerts"], data["cases"]
+            it2("session", "run", "--session", sid, f"cd {ROOT} && EH_TAB_STATUS=1 .venv/bin/eh --space {sp}")
+            watch(sid, lambda s: s.get("status") == "idle", timeout=40, label="idle at the prompt")
+            first, last = alerts[0], alerts[-1]
+            it2("session", "send", "--session", sid, "triage @alert:")
+            ok, screen = wait_screen(sid, [first.title[:24], first.where[:10]])
+            check("typing @alert: lists the open alerts (rule and host on screen)", ok, screen[-300:])
+            check("rows show their severity", first.severity in screen, first.severity)
+            word = next((w for w in last.title.lower().replace(":", " ").split() if len(w) >= 5 and w not in first.haystack), "")
+            if word:
+                it2("session", "send", "--session", sid, word)
+                ok, screen = wait_screen(sid, [last.title[:20]], timeout=5)
+                check(f"typing '{word}' narrows the list", ok and first.title[:24] not in screen, screen[-300:])
+                it2("session", "send", "--session", sid, "\x7f" * len(word))  # backspace: back to the full list
+                ok, screen = wait_screen(sid, [first.title[:24]], timeout=6)
+                check("backspacing re-opens the full list", ok, screen[-300:])
+            it2("session", "send", "--session", sid, "\t")
+            time.sleep(1)
+            flat = "".join(screen_text(sid).split())  # the long id wraps across lines
+            # the id is 64 characters and wraps under the menu, so only its start is visible: match the first alert's own prefix
+            check("Tab inserts the first alert's id after @alert:", f"@alert:{first.id[:24]}" in flat, flat[-200:])
+            it2("session", "send", "--session", sid, "\x15")  # Ctrl+U: clear the line
+            it2("session", "send", "--session", sid, "@case:")
+            ok, screen = wait_screen(sid, [cases[0].title[:20]])
+            check("typing @case: lists the recent open cases", ok, screen[-300:])
+            it2("session", "send", "--session", sid, "\t")
+            time.sleep(1)
+            flat = "".join(screen_text(sid).split())
+            check("Tab inserts the chosen case's id after @case:", cases[0].id.replace("-", "")[:8] in flat.replace("-", "") and "@case:" in flat, flat[-200:])
+            it2("session", "send", "--session", sid, "\x15")
+            if data["empty"]:
+                it2("session", "run", "--session", sid, f"/space {data['empty']}")
+                time.sleep(2)
+                it2("session", "send", "--session", sid, "@alert:")
+                ok, screen = wait_screen(sid, ["no open alerts in", f"/space {sp}"], timeout=12)
+                check("an empty space says so and points at the space that has alerts", ok, screen[-300:])
+                it2("session", "send", "--session", sid, "\x15")
+            it2("session", "run", "--session", sid, "/exit")
+            watch(sid, lambda s: not s.get("status"), timeout=15, label="clear")
     finally:
         if created:
             it2("session", "close", "--session", sid, "--force")

@@ -12,15 +12,14 @@ from pathlib import Path
 
 from rich.table import Table
 
-from . import __version__, agentcode, clusters, toolcode, transcript
+from . import __version__, agentcode, clusters, pickers, toolcode, transcript
 from .agent_chat import history_lines, run_turn, usage_line
 from .client import ApiError, Elastic
 from .compare import MAX_MODELS, render as render_compare, run_compare
 from .config import STATE_DIR, Config, ConfigError
-from .guard import expand_mentions
 from .ingest import ingest
 from .local_agent import LocalSession
-from .mentions import expand_elastic_mentions
+from .mentions import expand_all
 from .project import context_text, load_commands
 from .render import Ui, short
 from .tools import Ctx
@@ -52,6 +51,8 @@ COMMANDS = {
     "clear": "clear the screen",
     "exit": "quit",
 }
+_SEVERITY_STYLE = {"critical": "ansibrightred bold", "high": "ansired", "medium": "ansiyellow", "low": "ansigreen"}
+_KIND_HELP = {"alert:": "pick from the newest open alerts", "case:": "pick from recent open cases", "index:": "Elastic object"}
 _PREFERRED = ["5.5-sonnet", "4.6-sonnet", "sonnet", "haiku"]
 # slash commands slow enough to deserve "working" on the tab (the quick ones would only flicker it)
 SLOW_COMMANDS = {"compare", "ingest", "compact", "doctor", "cluster", "agent", "tool", "resume", "space", "export", "agents", "models"}
@@ -96,6 +97,7 @@ class Repl:
         self.last_error: str | None = None  # set when the last send failed: `eh -p` turns it into an exit code
         self.interrupted = False
         self.last_result: dict = {}  # conversation id, usage and tools of the last send: `eh -p --json` prints it
+        self.picker = pickers.Picker()  # the open alerts and cases behind `@alert:` and `@case:` completion
         self.connect(profile)
         self.reload_project()
         if space:
@@ -170,8 +172,7 @@ class Repl:
     def send(self, text: str, record: bool = True) -> None:
         if record:
             self.last_prompt = text
-        text, enotes = expand_elastic_mentions(text, self.client)
-        text, notes = expand_mentions(text, self.cwd)
+        text, enotes, notes = expand_all(text, self.client, self.cwd)  # @path is read from what you typed, never from alert text
         for n in enotes:
             bad = n["status"] != "attached"
             self.ui.line(f"[{'yellow' if bad else 'dim'}]@ {n['ref']} · {n['status']}[/{'yellow' if bad else 'dim'}]")
@@ -243,6 +244,42 @@ class Repl:
         self.local.turn(text)
         self.last_result = {"usage": {"input_tokens": self.local.tokens_in, "output_tokens": self.local.tokens_out}}
         self.ui.usage(f"{self.local.tokens_in:,} in / {self.local.tokens_out:,} out tokens this session · {self.model}")
+
+    # -- @mention completion ----------------------------------------------------------------
+    def mention_completions(self, tok: str) -> list:
+        """Completions for the word typed after '@' (prompt_toolkit Completion objects).
+
+        `alert`/`case`/`index` become `alert:`/`case:`/`index:`; once `@alert:` or `@case:` is typed, the newest open
+        alerts or cases in this space are offered, filtered by what follows the colon. Paths are the caller's job.
+        Runs on a completer thread: the list is a cached network call (see pickers.py).
+        """
+        from prompt_toolkit.completion import Completion
+        kind, colon, word = tok.partition(":")
+        if colon and kind in pickers.KINDS:
+            listing = self.picker.listing(self.client, kind)
+            rows = pickers.match(listing.rows, word)
+            if not rows:
+                # A note instead of a blank menu. prompt_toolkit drops a lone completion that changes nothing, so this one
+                # adds a space after the token: harmless if chosen, and it keeps the note on screen.
+                note = listing.note or f"no {kind} matches {word!r}"
+                return [Completion(f"{tok} ", -len(tok), display=[("ansibrightblack", note)])]
+            out = []
+            for r in rows:
+                title = r.title if len(r.title) <= 60 else r.title[:59] + "…"
+                shown = [(_SEVERITY_STYLE.get(r.severity, ""), f"{r.severity:<8}"), ("", f" {title}")]
+                if r.where:
+                    shown.append(("ansibrightblack", f"  {r.where}"))
+                meta = " · ".join(x for x in (r.extra, r.when) if x)
+                out.append(Completion(r.id, -len(word), display=shown, display_meta=meta))
+            return out
+        out = []
+        alias = {"alerts": "alert:", "cases": "case:"}.get(tok)
+        for k in ("alert:", "case:", "index:"):
+            if (k.startswith(tok) and tok != k) or k == alias:
+                out.append(Completion(k, -len(tok), display=f"@{k}", display_meta=_KIND_HELP[k]))
+                if len(tok) >= 2 and k != "index:":
+                    self.picker.prefetch(self.client, k[:-1])  # warm the list so it is there when the ':' is typed
+        return out
 
     # -- commands ---------------------------------------------------------------------------
     def handle(self, line: str) -> bool:
@@ -547,8 +584,7 @@ class Repl:
         if not prompt:
             return self.ui.error("nothing to compare yet: add ':: your prompt'")
         self.last_prompt = prompt
-        prompt, enotes = expand_elastic_mentions(prompt, self.client)
-        prompt, _ = expand_mentions(prompt, self.cwd)
+        prompt, enotes, _ = expand_all(prompt, self.client, self.cwd)
         what = (f"agent {self.agent_id} (tools run for real)" if self.mode == "agent" else "plain model answers, no tools (local mode)")
         with self.ui.console.status(f"running on {len(models)} models · {what}…"):
             results = run_compare(self.client, models, prompt, mode=self.mode, agent_id=self.agent_id)
@@ -756,7 +792,7 @@ class Repl:
                     break
             return
         from prompt_toolkit import PromptSession
-        from prompt_toolkit.completion import Completer, Completion, PathCompleter
+        from prompt_toolkit.completion import Completer, Completion, PathCompleter, ThreadedCompleter
         from prompt_toolkit.document import Document
         from prompt_toolkit.history import FileHistory
         from prompt_toolkit.key_binding import KeyBindings
@@ -779,9 +815,7 @@ class Repl:
                 m = re.search(r"@(\S*)$", text)
                 if m:
                     tok = m.group(1)
-                    for kind in ("alert:", "case:", "index:"):
-                        if kind.startswith(tok) and tok != kind:
-                            yield Completion(kind, -len(tok), display=f"@{kind}", display_meta="Elastic object")
+                    yield from repl.mention_completions(tok)
                     if ":" not in tok:
                         yield from self._paths(tok, event)
                     return
@@ -809,8 +843,17 @@ class Repl:
         def _newline(event):
             event.current_buffer.insert_text("\n")
 
+        @kb.add("backspace")
+        def _backspace(event):
+            # Deleting closes the completion menu and prompt_toolkit only reopens it on typing. While editing the word after
+            # `@alert:` or `@case:` bring the list back, so narrowing and widening the filter both work.
+            buf = event.current_buffer
+            buf.delete_before_cursor(count=event.arg)
+            if re.search(r"@(?:alert|case):\S*$", buf.document.text_before_cursor):
+                buf.start_completion(select_first=False)
+
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        session = PromptSession(history=FileHistory(str(STATE_DIR / "history")), completer=Comp(), key_bindings=kb,
+        session = PromptSession(history=FileHistory(str(STATE_DIR / "history")), completer=ThreadedCompleter(Comp()), key_bindings=kb,
                                 bottom_toolbar=lambda: (f" {repl.raw.name} · {repl.client.space} · agent {repl.agent_id} · "
                                                         f"model {repl.model or 'cluster default'} · mode {repl.mode} "),
                                 complete_while_typing=True)

@@ -1,5 +1,6 @@
 """Test doubles: a fake Elastic client and an in-memory keychain."""
 
+import copy
 import io
 
 from rich.console import Console
@@ -130,6 +131,40 @@ class FakeElastic:
 
     def case_alerts(self, cid):
         return [{"id": "alert-1"}]
+
+    # -- what the @alert:/@case: pickers list -------------------------------------------------
+    alerts_by_space = {"default": [], "demo": [
+        {"_id": "a" * 64, "_index": ".alerts-x", "_source": {"kibana.alert.rule.name": "Suspicious Echo Execution", "kibana.alert.severity": "critical",
+                                                            "host.name": "web-01", "user.name": "analyst", "@timestamp": "2026-11-23T15:55:55.599Z"}},
+        {"_id": "b" * 64, "_index": ".alerts-x", "_source": {"kibana.alert.rule.name": "Malware Prevention Alert", "kibana.alert.severity": "high",
+                                                            "host.name": "web-02", "user.name": "root", "@timestamp": "2026-11-23T15:50:00.000Z"}}]}
+    cases_by_space = {"default": [], "demo": [
+        {"id": "c1111111-aaaa", "title": "[SOC] Something ran on web-01", "status": "open", "severity": "high", "tags": ["demo"],
+         "totalAlerts": 1, "created_at": "2026-11-23T15:55:27.671Z"},
+        {"id": "c2222222-bbbb", "title": "Credential dump on a server", "status": "in-progress", "severity": "low", "tags": [],
+         "totalAlerts": 2, "created_at": "2026-11-23T15:52:00.000Z"}]}
+    listing_error = None  # an ApiError to raise from the listings
+
+    def in_space(self, space):
+        other = copy.copy(self)
+        other.space = space
+        return other
+
+    def open_alerts(self, limit=20):
+        self.calls.append(("open_alerts", self.space))
+        if self.listing_error:
+            raise self.listing_error
+        return list(self.alerts_by_space.get(self.space, []))[:limit]
+
+    def open_cases(self, limit=20):
+        self.calls.append(("open_cases", self.space))
+        if self.listing_error:
+            raise self.listing_error
+        return list(self.cases_by_space.get(self.space, []))[:limit]
+
+    def count_open(self, kind):
+        data = self.alerts_by_space if kind == "alert" else self.cases_by_space
+        return len(data.get(self.space, []))
 
 
 def quiet_ui(auto_yes=True):

@@ -24,9 +24,12 @@ In scope, because the README makes promises about them:
 - `eh agent push` or `eh tool push` changing something that was not shown first, or `--allow-risky` not being needed
   for tools that can run or approve workflows.
 - Anything that makes `eh` write outside the places it documents.
+- Text inside an alert, case, file or tool result making the harness read a file, run a command or change something without the
+  user asking or approving. (`@path` mentions used to be read out of alert and case text too; that was fixed.)
 
 Known and documented, not a vulnerability by themselves: local mode's file tools are not sandboxed; text from files,
-alerts and cases is sent to a model, which can be steered by instructions hidden in that text; the credential guard
+alerts and cases is sent to a model, and although it is labelled as untrusted data and cannot close its own block, a model
+can still be steered by instructions hidden in it (the approval prompts are the control); the credential guard
 is best effort. Please still tell me if you find a practical way to make any of these worse.
 
 Out of scope: flaws in Elasticsearch, Kibana or Agent Builder themselves. Report those to Elastic through

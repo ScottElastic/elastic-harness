@@ -99,12 +99,20 @@ privileges in that space. `/spaces` needs permission to list spaces (otherwise `
 | | |
 |---|---|
 | `@path/to/file` or `@folder` | A file's text, or a folder listing (up to ~90k characters). Tab completes |
-| `@alert:<id>` | A detection alert: rule, severity, host, process, reason and the other populated fields |
-| `@case:<id>` | A case: title, status, severity, description, notes, attached alert ids |
+| `@alert:<id>` | A detection alert: rule, severity, host, process, reason and the other populated fields. Type `@alert:` to pick one |
+| `@case:<id>` | A case: title, status, severity, description, notes, attached alert ids. Type `@case:` to pick one |
 | `@index:<pattern>` | An index's field list and 3 sample documents (ES\|QL `FROM … \| LIMIT 3`) |
 
 `@alert` and `@case` read with your key in the current space, so `/space my-space` first, then
 `triage @alert:<id>`.
+
+**Pickers.** Type `@alert:` and a list drops down of the 20 newest open alerts in the current space: severity, rule and host,
+with the time and user beside them. Keep typing to narrow it (rule, host, severity or part of the id), Tab or the arrow keys to
+choose, and the alert's id is filled in. `@case:` does the same for the 20 most recently created cases that are not closed (open
+or in progress), showing status and alert count. `@cases` and `@alerts` complete to `@case:` and `@alert:`, and Backspace brings
+the list back while you edit the word. The list follows `/space`: an empty space says so and names the ones that have some
+(`no open alerts in 'default' · try /space soc (9)`). It is fetched in the background and kept for 45 seconds, so typing never
+waits on Kibana. The rows put your rule and host names on screen: mind that when you share your screen.
 
 **Ctrl+C really stops the run.** Closing the connection does *not* stop an Agent Builder agent: Kibana carries on to
 the end and spends the tokens (verified: 934 tokens generated after a dropped connection). The harness calls Kibana's
@@ -265,15 +273,21 @@ retry. The summariser is told to keep every concrete fact and not to speculate.
   Non-interactive runs deny all of these unless `--yes`.
 - `elastic_tool` only runs custom `esql` and `index_search` tools. Ingest writes only `eh-local-*` indices and
   `eh-search-*` tools. Workflows and response actions are deliberately not exposed.
+- **Attached text is data, not instructions.** What `@path`, `@alert`, `@case` and `@index` bring in (a command line, a case
+  comment, a file) can be written by someone else. It goes into labelled blocks that the text cannot close or imitate, followed by
+  a note telling the model to treat it as untrusted data and never follow instructions in it; local mode's system prompt says
+  the same about tool results. `@path` mentions are read only from what you type, never from alert or case text. This lowers the
+  risk and does not remove it: a model can still be talked into things, so the approval prompts above are the real control. (In a
+  small trial with a blunt planted instruction, Haiku 4.5 and Sonnet 5.5 did not obey it with or without the note.)
 - **Where your data goes:** `@path`, `@alert`, `@case`, `@index` and local tools send content to the model through
   Elastic, and `/ingest` copies text into your cluster. Don't point them at data you wouldn't put there.
 
 ## Verify it
 
 ```bash
-.venv/bin/python -m unittest discover -s tests      # 100 offline tests (fake Elastic client, fake Keychain, fake model, fake terminal)
-.venv/bin/python scripts/rehearse.py                # 81 live checks against the active cluster
-.venv/bin/python scripts/iterm_check.py             # 11 checks inside a real iTerm2 session (opens a throwaway window)
+.venv/bin/python -m unittest discover -s tests      # 130 offline tests (fake Elastic client, fake Keychain, fake model, fake terminal)
+.venv/bin/python scripts/rehearse.py                # 91 live checks against the active cluster
+.venv/bin/python scripts/iterm_check.py             # 19 checks inside a real iTerm2 session: tab status, and the @alert:/@case: dropdowns (opens a throwaway window)
 .venv/bin/python scripts/rehearse.py --cleanup      # removes eh-demo, eh-code-demo, eh-search-kestrel, eh-tool-demo, eh-local-kestrel, test chats
 ```
 
@@ -293,6 +307,8 @@ above against the live cluster, including a real Keychain round trip with a dumm
   back to the mode-600 config file.
 - Local mode's file tools are plain Python, not sandboxed: treat `bash` like a terminal you handed to an assistant.
 - `/ingest` handles text files only and uses lexical search, no embeddings.
+- The `@case:` picker asks Kibana for `status=open` and `status=in-progress`; the test cluster has no in-progress cases, so that half is
+  accepted by the API but not seen returning one. Closed cases are filtered out on this side as well.
 - Tools as code was verified on 9.6.0 for `esql` and `index_search` tools. A tool's `confirmation` setting is not part of the
   file: `eh tool push` does not set it and `eh tool pull` does not record it.
 - Automatic compaction uses a token *estimate* (characters ÷ 3.5), not the model's own count.
