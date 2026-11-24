@@ -11,6 +11,8 @@ from rich.markdown import Markdown
 from rich.markup import escape
 from rich.prompt import Prompt
 
+from .status import TabStatus
+
 
 def short(value, limit: int = 140) -> str:
     s = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
@@ -19,8 +21,10 @@ def short(value, limit: int = 140) -> str:
 
 
 class Ui:
-    def __init__(self, console: Console | None = None, debug: bool = False, auto_yes: bool = False):
+    def __init__(self, console: Console | None = None, debug: bool = False, auto_yes: bool = False,
+                 status: TabStatus | None = None):
         self.console = console or Console(highlight=False)
+        self.status = status or TabStatus(stream=None, env={})  # a disabled one: tests and pipes never emit
         self.debug = debug
         self.auto_yes = auto_yes
         self._live: Live | None = None
@@ -104,8 +108,17 @@ class Ui:
             self.console.print(f"[dim]{escape(detail[:1500])}[/dim]")
         choices = ["y", "n", "a"] if allow_always else ["y", "n"]
         hint = "y = yes, n = no, a = yes and don't ask again this session" if allow_always else "y = yes, n = no"
-        return Prompt.ask(f"  [dim]{hint}[/dim]", choices=choices, default="n", console=self.console)
+        return self._waiting(title, lambda: Prompt.ask(f"  [dim]{hint}[/dim]", choices=choices, default="n", console=self.console))
 
     def ask(self, question: str, default: str = "") -> str:
         self.flush()
-        return Prompt.ask(question, default=default, console=self.console)
+        return self._waiting(question, lambda: Prompt.ask(question, default=default, console=self.console))
+
+    def _waiting(self, detail: str, ask):
+        """Show `waiting` on the tab while a person has to answer, then go back to what it was."""
+        prev = self.status.state
+        self.status.set("waiting", detail)
+        try:
+            return ask()
+        finally:
+            self.status.set(prev or "idle")

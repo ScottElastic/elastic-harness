@@ -386,6 +386,13 @@ class ReplFeatures(unittest.TestCase):
     def repl(self, **kw):
         return repl_mod.Repl(self.cfg, self.ui, **kw)
 
+    def test_exit_commands_really_exit(self):
+        r = self.repl()
+        for line in ("/exit", "/quit", "/q", "exit", "quit"):
+            self.assertFalse(r.handle(line), line)  # /exit was a silent no-op in 0.1.0
+        self.assertTrue(r.handle("/help"))
+        self.assertTrue(r.handle(""))
+
     def test_space_switch(self):
         r = self.repl()
         r.handle("/space demo")

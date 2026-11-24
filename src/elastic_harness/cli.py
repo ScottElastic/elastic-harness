@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import getpass
 import os
 import sys
@@ -13,6 +14,7 @@ from .client import ApiError, Elastic
 from .config import Config, ConfigError
 from .ingest import ingest
 from .render import Ui
+from .status import TabStatus
 from .repl import Repl
 
 
@@ -130,7 +132,9 @@ def _agent_cmd(cfg: Config, a: argparse.Namespace, ui: Ui) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     a = _parser().parse_args(argv)
-    ui = Ui(debug=a.debug, auto_yes=a.yes)
+    status = TabStatus()
+    atexit.register(status.clear)  # never leave a stale "done" on the tab after we exit
+    ui = Ui(debug=a.debug, auto_yes=a.yes, status=status)
     try:
         cfg = Config()
         if a.cmd in ("cluster", "profile"):

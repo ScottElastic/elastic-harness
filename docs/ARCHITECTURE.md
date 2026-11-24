@@ -78,6 +78,17 @@ A tool that needs approval makes the stream emit `prompt_request` with `prompt: 
 `conversation_id` and `prompts: {<id>: {allow: bool} | {authorized: bool} | {answers: [...]}}`. `agent_chat.py`
 implements this.
 
+## iTerm2 session status
+
+`status.py` emits `OSC 21337 ; status=<kw> ; indicator=<#rrggbb> ; status-color=<#rrggbb> ; detail=<text> BEL` (iTerm2 3.7.8;
+spec at iterm2.com/documentation-escape-codes.html, "Session Status"). Verified by running `eh` inside an iTerm session and
+reading back `it2 session get-status`: the status, both colors and the detail round-trip exactly. Facts from live Claude
+Code tabs: `working` = `#ff9500` for dot and text, `done` = `#00d75f`, and Claude's hook also stores a snippet of the last
+message as `detail`. iTerm applies no default colors for a status keyword (`it2 session set-status --status waiting` leaves
+both null), so the other colors are our choice. The keywords iTerm knows for priority sorting are waiting, working, idle
+(plus done and error). `it2` can open, read and force-close sessions, which makes the status end-to-end testable
+(`scripts/iterm_check.py`).
+
 ## Credential store
 
 `credstore.py` wraps the `keyring` package (macOS Keychain, service `elastic-harness`, account = cluster name). A profile

@@ -4,8 +4,9 @@ A terminal harness for Elastic Agent Builder (`eh`). Python 3.10+, runtime deps 
 the HTTP and SSE client is stdlib. Read `README.md` for usage and `docs/ARCHITECTURE.md` for verified API facts.
 
 ## Run
-- `.venv/bin/python -m unittest discover -s tests` (53 tests, offline, no cluster)
+- `.venv/bin/python -m unittest discover -s tests` (71 tests, offline, no cluster)
 - `.venv/bin/python scripts/rehearse.py` (live, uses the active profile) and `--cleanup` afterwards
+- `.venv/bin/python scripts/iterm_check.py` (needs iTerm2 3.7+; opens and force-closes a throwaway window)
 - `./install.sh` to (re)install and link `~/.local/bin/eh`
 
 ## Rules
@@ -20,3 +21,5 @@ the HTTP and SSE client is stdlib. Read `README.md` for usage and `docs/ARCHITEC
 - API keys belong in the Keychain (`credstore`) or a creds file read in place: never in code, tests or docs. Tests use
   `tests/fakes.py` (fake client, fake Keychain); the live rehearsal uses a temp config copy and a dummy Keychain value.
 - Closing an SSE connection does not stop an Agent Builder run: always pass an `execution_id` and abort on interrupt.
+- Tab status (`status.py`) writes only in iTerm2 on a tty and must be cleared at exit; free text in `detail` goes through
+  `status.clean` (no `;`, no control characters). Closing a session with `it2` needs `--force` or iTerm shows a dialog.

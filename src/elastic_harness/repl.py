@@ -46,11 +46,14 @@ COMMANDS = {
     "tools": "list the tools the current mode can use",
     "usage": "token usage this session",
     "doctor": "check connection, agents and models",
+    "tabstatus": "/tabstatus on|basic|off  iTerm2 tab status (working/waiting/done); basic hides the answer snippet",
     "debug": "toggle raw event display",
     "clear": "clear the screen",
     "exit": "quit",
 }
 _PREFERRED = ["5.5-sonnet", "4.6-sonnet", "sonnet", "haiku"]
+# slash commands slow enough to deserve "working" on the tab (the quick ones would only flicker it)
+SLOW_COMMANDS = {"compare", "ingest", "compact", "doctor", "cluster", "agent", "resume", "space", "export", "agents", "models"}
 _PATH_CMDS = re.compile(r"^/(ingest|export|agent (?:push|pull|diff))\s+(\S*)$")
 
 
@@ -121,7 +124,7 @@ class Repl:
 
     def reload_project(self) -> None:
         self.context, self.context_files = context_text(self.cwd)
-        self.cmds, self.cmd_warnings = load_commands(self.cwd, reserved=set(COMMANDS) | {"profile", "profiles", "quit", "q"})
+        self.cmds, self.cmd_warnings = load_commands(self.cwd, reserved=set(COMMANDS) | {"profile", "profiles", "quit", "q", "exit"})
 
     def agents(self) -> list[dict]:
         if self.agents_cache is None:
@@ -171,16 +174,22 @@ class Repl:
         for n in notes:
             colour = "yellow" if n["status"].startswith(("refused", "skipped")) else "dim"
             self.ui.line(f"[{colour}]@ {n['path']} · {n['status']}" + (f" · {n['chars']:,} chars" if n["chars"] else "") + f"[/{colour}]")
+        st = self.ui.status
+        st.set("working", self.last_prompt or text)
         try:
+            self.ui.last_answer = ""
             if self.mode == "local":
                 self._send_local(text)
             else:
                 self._send_agent(text)
+            st.set("done", self.ui.last_answer)
         except KeyboardInterrupt:
             self.ui.flush()
             self.ui.warn("interrupted")
+            st.set("idle", "interrupted")
         except ApiError as exc:
             self.ui.error(str(exc))
+            st.set("error", str(exc))
 
     def _send_agent(self, text: str) -> None:
         if self.conversation_id is None and self.context:  # EH.md goes in once, at the start of a conversation
@@ -225,11 +234,14 @@ class Repl:
             self.send(line)
             return True
         name, _, arg = line[1:].partition(" ")
-        if name in ("quit", "q"):
+        if name in ("exit", "quit", "q"):
             return False
         fn = getattr(self, f"cmd_{name}", None)
         try:
-            if fn is not None:
+            if fn is not None and name in SLOW_COMMANDS:
+                with self.ui.status.working(f"/{name} {arg.strip()}"[:80]):
+                    fn(arg.strip())
+            elif fn is not None:
                 fn(arg.strip())
             elif name in self.cmds:
                 self.run_custom(name, arg.strip())
@@ -621,15 +633,22 @@ class Repl:
         self.ui.ok(f"{len(self.agents())} agents · {len(self.models())} chat models")
         self.ui.info(f"agent {self.agent_id} · model {self.model or 'cluster default'} · mode {self.mode}")
 
+    def cmd_tabstatus(self, arg: str) -> None:
+        st = self.ui.status
+        if not arg:
+            where = "active" if st.enabled else ("off" if st.mode == "off" else "inactive: not running in iTerm2 on a terminal")
+            return self.ui.info(f"tab status: {st.mode} ({where}) · /tabstatus on|basic|off")
+        if arg not in ("on", "basic", "off"):
+            return self.ui.error("use /tabstatus on, basic or off")
+        st.set_mode(arg)
+        self.ui.ok(f"tab status: {arg}" + (" (no answer text on the tab: safe for screen sharing)" if arg == "basic" else ""))
+
     def cmd_debug(self, arg: str) -> None:
         self.ui.debug = not self.ui.debug
         self.ui.info(f"debug {'on' if self.ui.debug else 'off'}")
 
     def cmd_clear(self, arg: str) -> None:
         self.ui.console.clear()
-
-    def cmd_exit(self, arg: str) -> None:  # handled in handle(); kept so /help is honest
-        pass
 
     # -- interactive loop -------------------------------------------------------------------
     def banner(self) -> None:
@@ -714,6 +733,7 @@ class Repl:
             pass
         for w in self.cmd_warnings:
             self.ui.warn(w)
+        self.ui.status.set("idle")
         while True:
             try:
                 label = "local" if self.mode == "local" else self.agent_id

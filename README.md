@@ -82,6 +82,7 @@ privileges in that space. `/spaces` needs permission to list spaces (otherwise `
 | `/resume [n]`, `/new` | Reopen or restart a conversation |
 | `/compact` | Summarise older local-mode history now |
 | `/ingest <path> [--index n] [--tool] [--agent id]` | Load local text files into `eh-local-<n>`; `--tool` adds an `index_search` tool, `--agent` attaches it |
+| `/tabstatus on\|basic\|off` | iTerm2 tab status (see below) |
 | `/tools`, `/usage`, `/doctor`, `/debug`, `/clear`, `/help`, `/exit` | |
 
 **Mentions** put things in front of the model. They work in both modes and in `/compare`.
@@ -146,6 +147,28 @@ unknown tool ids, built-in agents, and tools that can run or approve workflows
   Triage @alert:$1. Give a verdict, the evidence, and the next two steps.
   ```
 
+## iTerm2 tab status
+
+In iTerm2 3.7+ the tab shows what the harness is doing, the same way it does for Claude Code: a colored dot and a
+subtitle under the tab title.
+
+| Tab shows | When |
+|---|---|
+| **idle** (green dot) | At the prompt, nothing running |
+| **working** (orange) | A prompt is running, or a slow command like `/compare`, `/ingest`, `/compact` |
+| **waiting** (yellow) | The harness is asking you something: run this command? write this file? approve this agent action? |
+| **done** (green) | The answer is ready. The subtitle detail carries a snippet of it |
+| **error** (red) | The request failed |
+
+The tab is cleared when `eh` exits, so a finished program never leaves a stale "done". `/tabstatus on|basic|off` (or
+`EH_TAB_STATUS=1|basic|0`) controls it. **Use `basic` when sharing your screen:** the answer snippet also shows in iTerm's
+Cockpit and Session Status toolbelt. Nothing is written outside iTerm2 or when output is not a terminal; inside tmux it
+needs `set -g allow-passthrough on`.
+
+It uses iTerm's `OSC 21337` escape sequence (`status`, `indicator`, `status-color`, `detail`). The `working` and `done`
+colors were read from live Claude Code tabs with `it2 session get-status`; iTerm sets no defaults for the other states, so
+`waiting`, `error` and `idle` use matching colors chosen here (`src/elastic_harness/status.py`).
+
 ## Getting local data in front of an agent
 
 Agent Builder runs inside Kibana, so it cannot read your disk, and its client-side (`browser_api_tools`) hook is
@@ -175,8 +198,9 @@ retry. The summariser is told to keep every concrete fact and not to speculate.
 ## Verify it
 
 ```bash
-.venv/bin/python -m unittest discover -s tests      # 53 offline tests (fake Elastic client, fake Keychain, fake model)
+.venv/bin/python -m unittest discover -s tests      # 71 offline tests (fake Elastic client, fake Keychain, fake model, fake terminal)
 .venv/bin/python scripts/rehearse.py                # 65 live checks against the active cluster
+.venv/bin/python scripts/iterm_check.py             # 11 checks inside a real iTerm2 session (opens a throwaway window)
 .venv/bin/python scripts/rehearse.py --cleanup      # removes eh-demo, eh-code-demo, eh-search-kestrel, eh-local-kestrel, test chats
 ```
 
