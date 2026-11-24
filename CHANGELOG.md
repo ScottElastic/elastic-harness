@@ -26,6 +26,7 @@ Notable changes. This project does not promise a stable interface yet (see the R
 - Continuous integration: the offline suite on Python 3.10 to 3.13 (Linux) and 3.12 (macOS).
 - `SECURITY.md`.
 - `scripts/iterm_check.py` now also types into a real prompt and reads the picker dropdowns back (19 checks).
+- CI uses `actions/checkout@v7` and `actions/setup-python@v7`, which run on Node 24 (the v4 and v5 it used declare Node 20, which GitHub is retiring).
 
 ### Fixed
 - **`@path` mentions were also read from alert and case text.** `@alert`/`@case` blocks were appended before `@path` mentions were
