@@ -16,6 +16,17 @@ from .guard import attach_blocks, gather_files, neutralize
 
 _ELASTIC = re.compile(r"(?<![\w@/.])@(alert|case|index):([\w.\-*,:/]+[\w*])")
 MAX_BLOCK = 7000
+_INCOMPLETE = re.compile(r"(?<![\w@/.])@(alert|case|index):(?![\w.\-*,:/]*[\w*])")
+_NEEDS = {"alert": "an alert id (type @alert: and press Tab to pick one)", "case": "a case id (type @case: and press Tab to pick one)",
+          "index": "an index pattern, e.g. @index:eh-local-*"}
+
+
+def incomplete_mentions(text: str) -> list[str]:
+    """What is missing after each bare `@alert:`, `@case:` or `@index:` in the text, e.g. 'an alert id (…)'.
+
+    A bare one was sent to the model as plain text once (it answered "your message got cut off"), so callers refuse it.
+    """
+    return [f"@{k}: needs {_NEEDS[k]}" for k in dict.fromkeys(x.group(1) for x in _INCOMPLETE.finditer(text))]
 
 ALERT_FIRST = [
     "@timestamp", "kibana.alert.rule.name", "kibana.alert.severity", "kibana.alert.risk_score",

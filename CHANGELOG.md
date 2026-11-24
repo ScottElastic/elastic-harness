@@ -29,6 +29,10 @@ Notable changes. This project does not promise a stable interface yet (see the R
 - CI uses `actions/checkout@v7` and `actions/setup-python@v7`, which run on Node 24 (the v4 and v5 it used declare Node 20, which GitHub is retiring).
 
 ### Fixed
+- **Tab-completing `@al` did not open the `@alert:` list.** Inserting a completion does not count as typing, so the list only
+  opened once you typed another character, and the stale kind row stayed on screen; pressing Enter then sent a bare `@alert:` to the
+  model. Tab now carries straight on into the list, Enter inside the word takes the top row instead of sending, and a bare
+  `@alert:`, `@case:` or `@index:` is refused with a hint (`not sent: …`).
 - **`@path` mentions were also read from alert and case text.** `@alert`/`@case` blocks were appended before `@path` mentions were
   expanded, so a field like `@~/notes.md` inside an alert pulled that local file into the prompt (credential files were still refused).
   `@path` is now read from what you typed only, in `/compare` too.

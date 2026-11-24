@@ -4,9 +4,9 @@ A terminal harness for Elastic Agent Builder (`eh`). Python 3.10+, runtime deps 
 the HTTP and SSE client is stdlib. Read `README.md` for usage and `docs/ARCHITECTURE.md` for verified API facts.
 
 ## Run
-- `.venv/bin/python -m unittest discover -s tests` (130 tests, offline, no cluster)
+- `.venv/bin/python -m unittest discover -s tests` (142 tests, offline, no cluster)
 - `.venv/bin/python scripts/rehearse.py` (live, uses the active profile) and `--cleanup` afterwards
-- `.venv/bin/python scripts/iterm_check.py` (19 checks; needs iTerm2 3.7+; opens and force-closes a throwaway window; also types into a
+- `.venv/bin/python scripts/iterm_check.py` (23 checks; needs iTerm2 3.7+; opens and force-closes a throwaway window; also types into a
   real prompt to check the @alert:/@case: dropdowns, which unit tests cannot see. Don't pipe it: `| tee` hides its exit code)
 - `./install.sh` to (re)install and link `~/.local/bin/eh`
 - CI (`.github/workflows/tests.yml`) runs the offline suite on Python 3.10 to 3.13 (Linux) and 3.12 (macOS). Keep tests free of a
@@ -25,7 +25,8 @@ the HTTP and SSE client is stdlib. Read `README.md` for usage and `docs/ARCHITEC
 - Text from `@path`, `@alert`, `@case`, `@index` is attacker-influenced. Build its blocks only with `guard.neutralize`/`attach_blocks`, and
   expand mentions only through `mentions.expand_all` on what the user typed: never run `@path` expansion over text that already carries blocks.
 - prompt_toolkit: a lone completion that changes nothing is silently dropped (so a "no results" note must add something, e.g. a space), and
-  deleting text closes the menu (the Backspace binding reopens it in `@alert:`/`@case:` words). Completion runs on a thread: no unguarded shared state.
+  deleting text closes the menu (the Backspace binding reopens it in `@alert:`/`@case:` words). Completion runs on a thread: no unguarded shared state. Inserting a completion (Tab) is not typing, so it does not
+  re-trigger completion. Test a picker the way a person reaches it (`@al` + Tab, Enter), not only by typing the whole token.
 - Mode and space are session-only; agent and model choices persist per cluster.
 - API keys belong in the Keychain (`credstore`) or a creds file read in place: never in code, tests or docs. Tests use
   `tests/fakes.py` (fake client, fake Keychain); the live rehearsal uses a temp config copy and a dummy Keychain value.

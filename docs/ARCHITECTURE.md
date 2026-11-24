@@ -71,6 +71,11 @@ prompt_toolkit 3.0.53, found by driving a real iTerm2 prompt (`scripts/iterm_che
   `completion_does_nothing`). A "no alerts here" note therefore replaces the token with itself plus a space, so it survives.
 - `Buffer._text_changed` clears the completion state, and complete-while-typing fires on insertion only: after Backspace the menu is
   gone. The prompt's Backspace binding restarts completion while the cursor is in an `@alert:`/`@case:` word.
+- Inserting a completion (Tab, Down) goes through `Buffer.go_to_completion`, which fires `on_text_changed` but not `on_text_insert`, so
+  complete-while-typing does not run for the new text: `@al` + Tab left `@alert:` with the old kind menu and no list. `Repl.on_tab` chains
+  into the picker when the completion just inserted is a kind. `Repl.on_enter` keeps Enter from sending while a list is open in an
+  `@alert:`/`@case:` word. Both take any buffer-like object, so unit tests drive them with fakes; the keys themselves are covered by
+  `scripts/iterm_check.py` (the first version of the picker passed its tests because they typed the whole `@alert:` token).
 - Completions are produced on a thread (`ThreadedCompleter`) and the menu is anchored at the cursor, truncating long rows on an
   80-column terminal, so notes put what to do (`try /space soc (9)`) before the rest.
 

@@ -188,6 +188,24 @@ def main() -> int:
             # the id is 64 characters and wraps under the menu, so only its start is visible: match the first alert's own prefix
             check("Tab inserts the first alert's id after @alert:", f"@alert:{first.id[:24]}" in flat, flat[-200:])
             it2("session", "send", "--session", sid, "\x15")  # Ctrl+U: clear the line
+            # the way a person actually gets there: type the start of the kind and Tab it. This once left the list shut and
+            # the stale "@alert:" kind row on screen, because inserting a completion is not "typing"
+            it2("session", "send", "--session", sid, "@al")
+            ok, screen = wait_screen(sid, ["pick from the newest open alerts"], timeout=6)
+            check("typing @al offers @alert:", ok, screen[-200:])
+            it2("session", "send", "--session", sid, "\t")
+            ok, screen = wait_screen(sid, [first.title[:24]], timeout=8)
+            check("Tab on @alert: carries straight on into the list of alerts", ok and "pick from the newest open alerts" not in screen, screen[-300:])
+            it2("session", "send", "--session", sid, "\x15")
+            # Enter inside the word picks the top row; it must not send the line (a bare "@alert:" once went to the model)
+            it2("session", "send", "--session", sid, "@alert:")
+            wait_screen(sid, [first.title[:24]], timeout=8)
+            it2("session", "send", "--session", sid, "\r")
+            time.sleep(2)
+            flat = "".join(screen_text(sid).split())
+            check("Enter takes the top row and does not send", f"@alert:{first.id[:24]}" in flat and status(sid).get("status") != "working",
+                  f"{status(sid).get('status')} {flat[-160:]}")
+            it2("session", "send", "--session", sid, "\x15")
             it2("session", "send", "--session", sid, "@case:")
             ok, screen = wait_screen(sid, [cases[0].title[:20]])
             check("typing @case: lists the recent open cases", ok, screen[-300:])
@@ -195,6 +213,11 @@ def main() -> int:
             time.sleep(1)
             flat = "".join(screen_text(sid).split())
             check("Tab inserts the chosen case's id after @case:", cases[0].id.replace("-", "")[:8] in flat.replace("-", "") and "@case:" in flat, flat[-200:])
+            it2("session", "send", "--session", sid, "\x15")
+            it2("session", "send", "--session", sid, "is this related to @alert: do you think?")  # a bare mention mid-sentence
+            it2("session", "send", "--session", sid, "\r")
+            ok, screen = wait_screen(sid, ["not sent", "needs an alert id"], timeout=6)
+            check("a bare @alert: is refused with a hint, not sent", ok and status(sid).get("status") != "working", screen[-300:])
             it2("session", "send", "--session", sid, "\x15")
             if data["empty"]:
                 it2("session", "run", "--session", sid, f"/space {data['empty']}")

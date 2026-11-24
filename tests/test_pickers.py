@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -16,6 +17,7 @@ import elastic_harness.repl as repl_mod
 from elastic_harness import credstore, guard, mentions, pickers
 from elastic_harness.client import ApiError, Elastic
 from elastic_harness.config import Config, Profile
+from elastic_harness.mentions import incomplete_mentions
 
 from fakes import FakeElastic, FakeKeychain, quiet_ui
 
@@ -351,6 +353,144 @@ class Completion(unittest.TestCase):
         sent = [c for c in self.r.client.calls if c[0] == "stream"][-1][1]["text"]
         self.assertIn("<elastic_alert", sent)
         self.assertEqual(sent.count("<untrusted_data_notice>"), 1)
+
+
+class FakeState:
+    """The bits of prompt_toolkit's CompletionState that Tab and Enter look at."""
+
+    def __init__(self, completions, index=None):
+        self.completions, self.complete_index = completions, index
+
+    @property
+    def current_completion(self):
+        return None if self.complete_index is None else self.completions[self.complete_index]
+
+
+class FakeBuffer:
+    def __init__(self, text, state=None):
+        self.document = SimpleNamespace(text_before_cursor=text)
+        self.complete_state, self.log = state, []
+
+    def complete_next(self):
+        self.log.append("next")
+        self.complete_state.complete_index = 0 if self.complete_state.complete_index is None else self.complete_state.complete_index + 1
+
+    def start_completion(self, **kw):
+        self.log.append(("start", kw))
+
+    def go_to_completion(self, i):
+        self.log.append(("go", i))
+        self.complete_state.complete_index = i
+
+
+class BareMentions(unittest.TestCase):
+    def test_what_counts_as_bare(self):
+        self.assertEqual(incomplete_mentions("@alert:"), ["@alert: needs an alert id (type @alert: and press Tab to pick one)"])
+        self.assertEqual(len(incomplete_mentions("look at @alert: and @case: and @index:")), 3)
+        self.assertEqual(len(incomplete_mentions("twice @alert: @alert:")), 1)  # one message per kind
+        for fine in ("@alert:abc123", "@case:1111-2222", "@index:eh-local-*", "@alert:a1 @case:c1", "mail me@alert:x", "no mention here",
+                     "@someone said alert: this", "path @src/alert:x"):
+            self.assertEqual(incomplete_mentions(fine), [], fine)
+        self.assertEqual(len(incomplete_mentions("(@alert:)")), 1)   # punctuation is not an id
+
+    def test_the_session_refuses_to_send_one(self):
+        c = Completion()
+        c.setUp()
+        try:
+            r = c.r
+            r.send("@alert:")
+            self.assertEqual([x for x in r.client.calls if x[0] == "stream"], [])     # nothing reached the agent
+            self.assertIn("not sent: @alert: needs an alert id", output_of(r.ui))
+            self.assertIn("needs an alert id", r.last_error)
+            self.assertIsNone(r.last_prompt)                                           # and it is not what /retry would resend
+            r.send("is this related to @alert:a1?")
+            self.assertEqual(len([x for x in r.client.calls if x[0] == "stream"]), 1)
+        finally:
+            c.tearDown()
+
+    def test_compare_refuses_too(self):
+        c = Completion()
+        c.setUp()
+        try:
+            c.r.handle("/compare sonnet 5.5 | haiku 4.5 :: what about @case:")
+            self.assertIn("not sent: @case: needs a case id", output_of(c.r.ui))
+            self.assertEqual([x for x in c.r.client.calls if x[0] in ("stream", "converse")], [])
+        finally:
+            c.tearDown()
+
+
+def output_of(ui):
+    return ui.console.file.getvalue()
+
+
+class KeyHandling(unittest.TestCase):
+    """Tab and Enter inside an @alert:/@case: word. Found in a real terminal: Tab-completing `@al` left the list shut, and
+    Enter then sent a bare `@alert:`. These cover the logic; scripts/iterm_check.py covers the keys themselves."""
+
+    def setUp(self):
+        self.c = Completion()
+        self.c.setUp()
+        self.r = self.c.r
+
+    def tearDown(self):
+        self.c.tearDown()
+
+    def rows(self, tok="alert:"):
+        return self.r.mention_completions(tok)
+
+    def test_tab_on_a_kind_opens_the_list(self):
+        buf = FakeBuffer("triage @al", FakeState(self.rows("al")))
+        self.r.on_tab(buf)
+        self.assertEqual(buf.log, ["next", ("start", {"select_first": False})])  # moved onto `alert:`, then re-opened for the rows
+        self.assertIsNone(buf.complete_state)                                      # the stale kind menu is gone
+
+    def test_tab_on_a_row_just_moves_on(self):
+        buf = FakeBuffer("@alert:", FakeState(self.rows()))
+        self.r.on_tab(buf)
+        self.assertEqual(buf.log, ["next"])
+        self.assertEqual(buf.complete_state.complete_index, 0)
+        self.r.on_tab(buf)
+        self.assertEqual(buf.complete_state.complete_index, 1)
+
+    def test_tab_with_no_menu_starts_one(self):
+        buf = FakeBuffer("@alert:")
+        self.r.on_tab(buf)
+        self.assertEqual(buf.log, [("start", {"insert_common_part": True})])
+
+    def test_enter_with_no_list_or_outside_a_picker_word_sends(self):
+        self.assertFalse(self.r.on_enter(FakeBuffer("@alert:")))                                   # no menu
+        self.assertFalse(self.r.on_enter(FakeBuffer("hello", FakeState(self.rows()))))             # not in an @alert: word
+        self.assertFalse(self.r.on_enter(FakeBuffer("see @index:", FakeState(self.rows("alert:")))))
+        self.assertFalse(self.r.on_enter(FakeBuffer("@alert:" + "a" * 64, None)))                  # a chosen id, menu closed: send
+
+    def test_enter_takes_the_top_row_instead_of_sending(self):
+        buf = FakeBuffer("@alert:", FakeState(self.rows()))
+        self.assertTrue(self.r.on_enter(buf))
+        self.assertEqual(buf.log, [("go", 0)])
+        self.assertIsNone(buf.complete_state)
+
+    def test_enter_after_a_filter_word_takes_the_first_match(self):
+        buf = FakeBuffer("@alert:malw", FakeState(self.rows("alert:malw")))
+        self.assertTrue(self.r.on_enter(buf))
+        self.assertEqual(buf.log, [("go", 0)])
+
+    def test_enter_on_a_highlighted_id_confirms_without_sending(self):
+        buf = FakeBuffer("@alert:" + "a" * 64, FakeState(self.rows(), index=1))
+        self.assertTrue(self.r.on_enter(buf))
+        self.assertEqual(buf.log, [])               # nothing more to insert
+        self.assertIsNone(buf.complete_state)       # menu closed: the next Enter sends
+
+    def test_enter_on_a_highlighted_kind_opens_the_list(self):
+        buf = FakeBuffer("@alert:", FakeState(self.rows("al"), index=0))
+        self.assertTrue(self.r.on_enter(buf))
+        self.assertEqual(buf.log, [("start", {"select_first": False})])
+
+    def test_enter_never_sends_a_bare_mention_when_only_a_note_is_showing(self):
+        self.r.client.space = "default"                  # empty space: the list is a single note
+        buf = FakeBuffer("@alert:", FakeState(self.rows()))
+        self.assertTrue(self.r.on_enter(buf))
+        self.assertEqual(buf.log, [])                    # no id to take
+        self.assertIsNone(buf.complete_state)
 
 
 if __name__ == "__main__":

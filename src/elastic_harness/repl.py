@@ -19,7 +19,7 @@ from .compare import MAX_MODELS, render as render_compare, run_compare
 from .config import STATE_DIR, Config, ConfigError
 from .ingest import ingest
 from .local_agent import LocalSession
-from .mentions import expand_all
+from .mentions import expand_all, incomplete_mentions
 from .project import context_text, load_commands
 from .render import Ui, short
 from .tools import Ctx
@@ -52,6 +52,8 @@ COMMANDS = {
     "exit": "quit",
 }
 _SEVERITY_STYLE = {"critical": "ansibrightred bold", "high": "ansired", "medium": "ansiyellow", "low": "ansigreen"}
+_KIND_TEXTS = ("alert:", "case:")          # the text of the completions that offer the pickers
+_PICK_WORD = re.compile(r"@(?:alert|case):\S*$")  # the cursor is in the word after `@alert:` or `@case:`
 _KIND_HELP = {"alert:": "pick from the newest open alerts", "case:": "pick from recent open cases", "index:": "Elastic object"}
 _PREFERRED = ["5.5-sonnet", "4.6-sonnet", "sonnet", "haiku"]
 # slash commands slow enough to deserve "working" on the tab (the quick ones would only flicker it)
@@ -170,6 +172,10 @@ class Repl:
 
     # -- sending ----------------------------------------------------------------------------
     def send(self, text: str, record: bool = True) -> None:
+        missing = incomplete_mentions(text)
+        if missing:  # a bare `@alert:` is not a question: say what to do instead of sending it
+            self.last_error = missing[0]
+            return self.ui.error(f"not sent: {'; '.join(missing)}")
         if record:
             self.last_prompt = text
         text, enotes, notes = expand_all(text, self.client, self.cwd)  # @path is read from what you typed, never from alert text
@@ -280,6 +286,37 @@ class Repl:
                 if len(tok) >= 2 and k != "index:":
                     self.picker.prefetch(self.client, k[:-1])  # warm the list so it is there when the ':' is typed
         return out
+
+    def on_tab(self, buf) -> None:
+        """Tab. As prompt_toolkit's own (next completion, or start completing), plus: when that turned `@al` into `@alert:`
+        carry straight on into the list. Inserting a completion does not count as typing, so without this the list only
+        opened once you typed another character (the stale `@alert:` kind row just stayed on screen)."""
+        if buf.complete_state:
+            buf.complete_next()
+        else:
+            buf.start_completion(insert_common_part=True)
+        cur = buf.complete_state.current_completion if buf.complete_state else None
+        if cur is not None and cur.text in _KIND_TEXTS:
+            buf.complete_state = None
+            buf.start_completion(select_first=False)
+
+    def on_enter(self, buf) -> bool:
+        """Enter while a list is open on an `@alert:`/`@case:` word: choose from it, do not send the line. Returns False
+        when Enter should submit as usual (no list open, or not in such a word)."""
+        st = buf.complete_state
+        if not st or not st.completions or not _PICK_WORD.search(buf.document.text_before_cursor):
+            return False
+        cur = st.current_completion
+        if cur is not None:                        # a row is highlighted and its text is already in the line
+            buf.complete_state = None
+            if cur.text in _KIND_TEXTS:            # ...but it is only the kind: go on to the list
+                buf.start_completion(select_first=False)
+            return True                            # an id (or a note): that is the choice, send on the next Enter
+        first = next((i for i, c in enumerate(st.completions) if c.text not in _KIND_TEXTS and not c.text.endswith(" ")), None)
+        if first is not None:                      # nothing highlighted: take the top row
+            buf.go_to_completion(first)
+        buf.complete_state = None
+        return True                                # a note or no rows: still never send a bare `@alert:`
 
     # -- commands ---------------------------------------------------------------------------
     def handle(self, line: str) -> bool:
@@ -583,6 +620,9 @@ class Repl:
         prompt = right.strip() if sep and right.strip() else self.last_prompt
         if not prompt:
             return self.ui.error("nothing to compare yet: add ':: your prompt'")
+        missing = incomplete_mentions(prompt)
+        if missing:
+            return self.ui.error(f"not sent: {'; '.join(missing)}")
         self.last_prompt = prompt
         prompt, enotes, _ = expand_all(prompt, self.client, self.cwd)
         what = (f"agent {self.agent_id} (tools run for real)" if self.mode == "agent" else "plain model answers, no tools (local mode)")
@@ -794,6 +834,8 @@ class Repl:
         from prompt_toolkit import PromptSession
         from prompt_toolkit.completion import Completer, Completion, PathCompleter, ThreadedCompleter
         from prompt_toolkit.document import Document
+        from prompt_toolkit.enums import DEFAULT_BUFFER
+        from prompt_toolkit.filters import has_focus
         from prompt_toolkit.history import FileHistory
         from prompt_toolkit.key_binding import KeyBindings
 
@@ -842,6 +884,15 @@ class Repl:
         @kb.add("escape", "enter")
         def _newline(event):
             event.current_buffer.insert_text("\n")
+
+        @kb.add("tab", filter=has_focus(DEFAULT_BUFFER))
+        def _tab(event):
+            repl.on_tab(event.current_buffer)
+
+        @kb.add("enter", filter=has_focus(DEFAULT_BUFFER))
+        def _enter(event):
+            if not repl.on_enter(event.current_buffer):
+                event.current_buffer.validate_and_handle()  # what prompt_toolkit's own Enter does
 
         @kb.add("backspace")
         def _backspace(event):
