@@ -18,7 +18,7 @@ All facts verified on Kibana/Elasticsearch **9.6.0** (Elastic Cloud, traditional
 | Local-mode LLM | `POST /_inference/chat_completion/{id}/_stream` | OpenAI-style SSE with streamed `tool_calls`; `[DONE]` terminates |
 | ES\|QL | `POST /_query` | Read-only by nature |
 | Spaces | prefix `/s/<space>` before `/api/…` *(docs)* | The default space needs no prefix |
-| List spaces | `GET /api/spaces/space` | Not space-scoped; returned `default`, `my-space` |
+| List spaces | `GET /api/spaces/space` | Not space-scoped; returned `default` and one other space |
 | Stop a run | `POST /internal/agent_builder/executions/{execution_id}/abort` | **Internal** API: needs `x-elastic-internal-origin: kibana` and `Elastic-Api-Version: 1`; returns `{acknowledged, terminal_persisted}` |
 | Alert by id | `POST /api/detection_engine/signals/search` `{query:{ids:{values:[id]}}}` | Space-scoped and RBAC-respecting; `_source` has dotted keys (about 90 fields) |
 | Case | `GET /api/cases/{id}`, `/comments/_find?perPage=20`, `/alerts` | `GET /cases/{id}/comments` itself is 404 |

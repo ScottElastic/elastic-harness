@@ -1,5 +1,11 @@
 # Elastic Harness
 
+> **Experimental.** This is a personal project, not an official
+> Elastic product, and Elastic does not support it. It talks to
+> your own Elastic deployment with your own API key. Check what
+> data you are sending to a model before pointing it at anything
+> sensitive. Use at your own risk.
+
 A Claude Code-style terminal harness for **Elastic Agent Builder**. Chat with your custom agents, switch clusters,
 spaces, agents and models on the fly, point them at files on your Mac or at alerts and cases in Kibana, and let the
 harness run tools locally when you want it to.
@@ -221,3 +227,7 @@ above against the live cluster, including a real Keychain round trip with a dumm
 - Local mode's file tools are plain Python, not sandboxed: treat `bash` like a terminal you handed to an assistant.
 - `/ingest` handles text files only and uses lexical search, no embeddings.
 - Automatic compaction uses a token *estimate* (characters ÷ 3.5), not the model's own count.
+
+## License
+
+Apache-2.0. See `LICENSE`.
