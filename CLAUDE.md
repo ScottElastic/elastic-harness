@@ -23,3 +23,8 @@ the HTTP and SSE client is stdlib. Read `README.md` for usage and `docs/ARCHITEC
 - Closing an SSE connection does not stop an Agent Builder run: always pass an `execution_id` and abort on interrupt.
 - Tab status (`status.py`) writes only in iTerm2 on a tty and must be cleared at exit; free text in `detail` goes through
   `status.clean` (no `;`, no control characters). Closing a session with `it2` needs `--force` or iTerm shows a dialog.
+- **This repo is PUBLIC** (github.com/ScottElastic/elastic-harness, Apache-2.0). Never commit credentials, cluster URLs or ids,
+  customer or project names, or real data from a cluster. Commits use the GitHub noreply identity set in this repo's
+  git config; never put a real name or work email in commit metadata. Run the secret scan before every push.
+- Never force-push this repo: GitHub's public activity API lists force-push hashes and keeps the replaced commits fetchable.
+  If history ever needs rewriting, create a fresh repo instead (that is how the first version was scrubbed).
