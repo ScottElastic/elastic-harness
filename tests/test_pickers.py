@@ -86,6 +86,14 @@ class Framing(unittest.TestCase):
             self.assertEqual([n["status"] for n in notes], ["attached"])
             self.assertEqual(text.count("<untrusted_data_notice>"), 1)
 
+    def test_the_plural_is_the_same_mention(self):
+        text, enotes, _ = mentions.expand_all("is @cases:c1 linked to @alerts:a1?", client())
+        self.assertEqual([n["ref"] for n in enotes], ["case:c1", "alert:a1"])      # fetched as the singular
+        self.assertEqual([n["status"] for n in enotes], ["attached", "attached"])
+        self.assertTrue(text.startswith("is case c1 linked to alert a1?"))
+        self.assertIn("<elastic_case", text)
+        self.assertIn("<elastic_alert", text)
+
     def test_an_elastic_mention_is_not_read_as_a_path(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "alert").write_text("A FILE NAMED ALERT")  # `@alert:a1` must not attach this
@@ -173,7 +181,7 @@ class Listings(unittest.TestCase):
         self.assertEqual(got.rows, ())
         self.assertTrue(got.ok)
         self.assertEqual(got.note, "no open alerts in 'default' · try /space demo (2)")
-        self.assertEqual(self.p.listing(c, "case").note, "no open cases in 'default' · try /space demo (2)")
+        self.assertEqual(self.p.listing(c, "case").note, "no open security cases in 'default' · try /space demo (2)")
         with mock.patch.object(FakeElastic, "alerts_by_space", {"default": [], "demo": []}):
             self.p.forget()
             self.assertEqual(self.p.listing(c, "alert").note, "no open alerts in 'default'")  # nowhere else either
@@ -236,12 +244,33 @@ class ClientCalls(unittest.TestCase):
 
     def test_open_cases_are_newest_created_first_and_never_closed(self):
         reply = {"cases": [{"id": "1", "status": "open"}, {"id": "2", "status": "closed"}, {"id": "3", "status": "in-progress"}]}
-        with mock.patch.object(Elastic, "kb", return_value=reply) as kb:
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(Elastic, "kb", return_value=reply) as kb:
+            os.environ.pop("EH_CASE_OWNER", None)
             got = self.c.open_cases(20)
         self.assertEqual([c["id"] for c in got], ["1", "3"])
         path = kb.call_args.args[1]
         for part in ("status=open", "status=in-progress", "perPage=20", "sortField=createdAt", "sortOrder=desc"):
             self.assertIn(part, path)
+
+    def test_cases_default_to_security_and_the_owner_can_be_changed(self):
+        def path_for(env, call):
+            with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(Elastic, "kb", return_value={"cases": [], "total": 0}) as kb:
+                if env.get("UNSET"):
+                    os.environ.pop("EH_CASE_OWNER", None)
+                call()
+            return kb.call_args.args[1]
+        self.assertIn("&owner=securitySolution", path_for({"UNSET": "1"}, lambda: self.c.open_cases(20)))   # the default
+        self.assertIn("&owner=securitySolution", path_for({"UNSET": "1"}, lambda: self.c.count_open("case")))
+        self.assertIn("&owner=observability", path_for({"EH_CASE_OWNER": "observability"}, lambda: self.c.open_cases(20)))
+        self.assertNotIn("owner=", path_for({"EH_CASE_OWNER": ""}, lambda: self.c.open_cases(20)))           # empty: every owner
+        self.assertNotIn("owner=", path_for({"EH_CASE_OWNER": " "}, lambda: self.c.count_open("case")))
+
+    def test_the_label_follows_the_owner(self):
+        c = client("default")
+        with mock.patch.dict(os.environ, {"EH_CASE_OWNER": ""}):
+            self.assertEqual(pickers.Picker().listing(c, "case").note, "no open cases in 'default' · try /space demo (2)")
+        with mock.patch.dict(os.environ, {"EH_CASE_OWNER": "observability"}):
+            self.assertEqual(pickers.Picker().listing(c, "case").note, "no open cases in 'default' · try /space demo (2)")
 
     def test_counts(self):
         with mock.patch.object(Elastic, "kb", return_value={"hits": {"total": {"value": 9}}}) as kb:
@@ -320,7 +349,13 @@ class Completion(unittest.TestCase):
         self.r.client.listing_error = ApiError(500, "boom")
         cs = self.r.mention_completions("case:")
         self.assertEqual(len(cs), 1)
-        self.assertIn("could not list open cases", cs[0].display_text)
+        self.assertIn("could not list open security cases", cs[0].display_text)
+
+    def test_the_plural_with_a_colon_is_a_picker_too(self):
+        # `@cases:` once showed nothing: only `@cases` + Tab was understood
+        self.assertEqual([c.text for c in self.r.mention_completions("cases:")], ["c1111111-aaaa", "c2222222-bbbb"])
+        self.assertEqual([c.text for c in self.r.mention_completions("alerts:malw")], ["b" * 64])
+        self.assertEqual(self.r.mention_completions("cases:")[0].start_position, 0)
 
     def test_kinds_and_the_plural_aliases(self):
         self.assertEqual([c.text for c in self.r.mention_completions("al")], ["alert:"])
@@ -392,6 +427,9 @@ class BareMentions(unittest.TestCase):
                      "@someone said alert: this", "path @src/alert:x"):
             self.assertEqual(incomplete_mentions(fine), [], fine)
         self.assertEqual(len(incomplete_mentions("(@alert:)")), 1)   # punctuation is not an id
+        self.assertEqual(incomplete_mentions("@cases:"), ["@case: needs a case id (type @case: and press Tab to pick one)"])  # the plural counts
+        self.assertEqual(len(incomplete_mentions("@alerts: and @alert:")), 1)
+        self.assertEqual(incomplete_mentions("@cases:c1 @alerts:a1"), [])
 
     def test_the_session_refuses_to_send_one(self):
         c = Completion()
@@ -462,6 +500,11 @@ class KeyHandling(unittest.TestCase):
         self.assertFalse(self.r.on_enter(FakeBuffer("hello", FakeState(self.rows()))))             # not in an @alert: word
         self.assertFalse(self.r.on_enter(FakeBuffer("see @index:", FakeState(self.rows("alert:")))))
         self.assertFalse(self.r.on_enter(FakeBuffer("@alert:" + "a" * 64, None)))                  # a chosen id, menu closed: send
+
+    def test_enter_and_the_plural(self):
+        buf = FakeBuffer("@cases:", FakeState(self.rows("cases:")))
+        self.assertTrue(self.r.on_enter(buf))
+        self.assertEqual(buf.log, [("go", 0)])
 
     def test_enter_takes_the_top_row_instead_of_sending(self):
         buf = FakeBuffer("@alert:", FakeState(self.rows()))

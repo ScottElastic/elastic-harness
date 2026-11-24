@@ -109,7 +109,8 @@ privileges in that space. `/spaces` needs permission to list spaces (otherwise `
 **Pickers.** Type `@alert:` and a list drops down of the 20 newest open alerts in the current space: severity, rule and host,
 with the time and user beside them. Keep typing to narrow it (rule, host, severity or part of the id), Tab or the arrow keys to
 choose, and the alert's id is filled in. `@case:` does the same for the 20 most recently created cases that are not closed (open
-or in progress), showing status and alert count. `@cases` and `@alerts` complete to `@case:` and `@alert:`. Typing `@al` and pressing
+or in progress), showing status and alert count. Cases are **Security cases** by default; set `EH_CASE_OWNER=observability` (or `cases` for
+Stack Management, or empty for every owner) to list others. `@cases:` and `@alerts:` mean the same as `@case:` and `@alert:` (and `@cases` + Tab completes to `@case:`). Typing `@al` and pressing
 Tab goes straight on into the list. Inside the word, Enter takes the top row (or confirms the highlighted one) instead of sending the
 line, and Backspace brings the list back while you edit the word. A bare `@alert:`, `@case:` or `@index:` is never sent: you get
 `not sent: @alert: needs an alert id …` instead. The list follows `/space`: an empty space says so and names the ones that have some
@@ -287,9 +288,9 @@ retry. The summariser is told to keep every concrete fact and not to speculate.
 ## Verify it
 
 ```bash
-.venv/bin/python -m unittest discover -s tests      # 142 offline tests (fake Elastic client, fake Keychain, fake model, fake terminal)
+.venv/bin/python -m unittest discover -s tests      # 147 offline tests (fake Elastic client, fake Keychain, fake model, fake terminal)
 .venv/bin/python scripts/rehearse.py                # 91 live checks against the active cluster
-.venv/bin/python scripts/iterm_check.py             # 23 checks inside a real iTerm2 session: tab status, and the @alert:/@case: dropdowns (opens a throwaway window)
+.venv/bin/python scripts/iterm_check.py             # 25 checks inside a real iTerm2 session: tab status, and the @alert:/@case: dropdowns (opens a throwaway window)
 .venv/bin/python scripts/rehearse.py --cleanup      # removes eh-demo, eh-code-demo, eh-search-kestrel, eh-tool-demo, eh-local-kestrel, test chats
 ```
 

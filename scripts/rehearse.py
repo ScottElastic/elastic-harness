@@ -607,6 +607,7 @@ def new_features(client: Elastic, s: dict, models: list[str], haiku: str, sonnet
         check("@case: lists recent cases that are not closed", cc and len(cc) <= pickers.LIMIT and all("closed" not in c.display_meta_text for c in cc), str([c.display_meta_text for c in cc][:3]))
         text, enotes, _ = expand_all(f"what is going on with @case:{cc[0].text}", r.client)
         check("a picked case id expands into its block", enotes and enotes[0]["status"] == "attached" and "<elastic_case" in text, str(enotes))
+        check("the case list is Security cases (the default owner)", all(x.get("owner") == "securitySolution" for x in cases), str({x.get("owner") for x in cases}))
         newest = max(cases, key=lambda x: x.get("created_at", ""))
         check("cases come newest created first", cc[0].text == newest["id"], f"{cc[0].text} vs {newest['id']}")
         if empty:

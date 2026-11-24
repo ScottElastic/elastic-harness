@@ -120,6 +120,7 @@ class Mentions(unittest.TestCase):
         for t in ["mail me@alert:x.com", "see @notes.md", "@alerts are noisy"]:
             self.assertIsNone(_ELASTIC.search(t), t)
         self.assertEqual(_ELASTIC.search("triage @alert:abc123 now").groups(), ("alert", "abc123"))
+        self.assertEqual(_ELASTIC.search("is it @cases:c-1 or @alerts:a-1").groups(), ("cases", "c-1"))  # the plural works too
         self.assertEqual(_ELASTIC.search("fields of @index:logs-*, ok").group(2), "logs-*")
 
     def test_expand(self):

@@ -206,14 +206,15 @@ def main() -> int:
             check("Enter takes the top row and does not send", f"@alert:{first.id[:24]}" in flat and status(sid).get("status") != "working",
                   f"{status(sid).get('status')} {flat[-160:]}")
             it2("session", "send", "--session", sid, "\x15")
-            it2("session", "send", "--session", sid, "@case:")
-            ok, screen = wait_screen(sid, [cases[0].title[:20]])
-            check("typing @case: lists the recent open cases", ok, screen[-300:])
-            it2("session", "send", "--session", sid, "\t")
-            time.sleep(1)
-            flat = "".join(screen_text(sid).split())
-            check("Tab inserts the chosen case's id after @case:", cases[0].id.replace("-", "")[:8] in flat.replace("-", "") and "@case:" in flat, flat[-200:])
-            it2("session", "send", "--session", sid, "\x15")
+            for typed in ("@case:", "@cases:"):  # the plural with a colon is how people type it: it once showed nothing
+                it2("session", "send", "--session", sid, typed)
+                ok, screen = wait_screen(sid, [cases[0].title[:20]], timeout=8)
+                check(f"typing {typed} lists the recent open cases", ok, screen[-300:])
+                it2("session", "send", "--session", sid, "\t")
+                time.sleep(1)
+                flat = "".join(screen_text(sid).split())
+                check(f"Tab inserts the chosen case's id after {typed}", f"{typed}{cases[0].id[:8]}" in flat, flat[-200:])
+                it2("session", "send", "--session", sid, "\x15")
             it2("session", "send", "--session", sid, "is this related to @alert: do you think?")  # a bare mention mid-sentence
             it2("session", "send", "--session", sid, "\r")
             ok, screen = wait_screen(sid, ["not sent", "needs an alert id"], timeout=6)

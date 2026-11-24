@@ -4,9 +4,9 @@ A terminal harness for Elastic Agent Builder (`eh`). Python 3.10+, runtime deps 
 the HTTP and SSE client is stdlib. Read `README.md` for usage and `docs/ARCHITECTURE.md` for verified API facts.
 
 ## Run
-- `.venv/bin/python -m unittest discover -s tests` (142 tests, offline, no cluster)
+- `.venv/bin/python -m unittest discover -s tests` (147 tests, offline, no cluster)
 - `.venv/bin/python scripts/rehearse.py` (live, uses the active profile) and `--cleanup` afterwards
-- `.venv/bin/python scripts/iterm_check.py` (23 checks; needs iTerm2 3.7+; opens and force-closes a throwaway window; also types into a
+- `.venv/bin/python scripts/iterm_check.py` (25 checks; needs iTerm2 3.7+; opens and force-closes a throwaway window; also types into a
   real prompt to check the @alert:/@case: dropdowns, which unit tests cannot see. Don't pipe it: `| tee` hides its exit code)
 - `./install.sh` to (re)install and link `~/.local/bin/eh`
 - CI (`.github/workflows/tests.yml`) runs the offline suite on Python 3.10 to 3.13 (Linux) and 3.12 (macOS). Keep tests free of a

@@ -59,7 +59,9 @@ Verified on 9.6.0 (read-only), about 0.4 s per call.
 - Alerts: `POST /api/detection_engine/signals/search` with `{query: {term: {"kibana.alert.workflow_status": "open"}}, sort:
   [{"@timestamp": "desc"}], size: 20, _source: [rule name, severity, host.name, user.name, @timestamp]}`. `_id` is a 64-character hash.
   A count is the same call with `size: 0, track_total_hits: true`.
-- Cases: `GET /api/cases/_find?status=open&status=in-progress&perPage=20&sortField=createdAt&sortOrder=desc`. The repeated `status` is
+- Cases: `GET /api/cases/_find?owner=securitySolution&status=open&status=in-progress&perPage=20&sortField=createdAt&sortOrder=desc`. `owner` is
+  `securitySolution`, `observability` or `cases` (Stack Management); without it `_find` returns every owner the key can see, so the picker
+  asks for Security cases unless `EH_CASE_OWNER` says otherwise (all test-cluster cases are Security, so the filter is not visible there). The repeated `status` is
   accepted, but the test cluster has no in-progress case, so it was not seen returning one; closed cases are also dropped client-side.
   Fields used: `id, title, status, severity, tags, totalAlerts, created_at`. `total` gives the count.
 - The picker reads the space once per listing (`Elastic.in_space` copies the client) and keys its cache by cluster, space and kind, so

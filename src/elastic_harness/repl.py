@@ -53,7 +53,7 @@ COMMANDS = {
 }
 _SEVERITY_STYLE = {"critical": "ansibrightred bold", "high": "ansired", "medium": "ansiyellow", "low": "ansigreen"}
 _KIND_TEXTS = ("alert:", "case:")          # the text of the completions that offer the pickers
-_PICK_WORD = re.compile(r"@(?:alert|case):\S*$")  # the cursor is in the word after `@alert:` or `@case:`
+_PICK_WORD = re.compile(r"@(?:alerts?|cases?):\S*$")  # the cursor is in the word after `@alert:`, `@case:` (or the plurals)
 _KIND_HELP = {"alert:": "pick from the newest open alerts", "case:": "pick from recent open cases", "index:": "Elastic object"}
 _PREFERRED = ["5.5-sonnet", "4.6-sonnet", "sonnet", "haiku"]
 # slash commands slow enough to deserve "working" on the tab (the quick ones would only flicker it)
@@ -261,6 +261,7 @@ class Repl:
         """
         from prompt_toolkit.completion import Completion
         kind, colon, word = tok.partition(":")
+        kind = {"alerts": "alert", "cases": "case"}.get(kind, kind)   # `@cases:` is `@case:`
         if colon and kind in pickers.KINDS:
             listing = self.picker.listing(self.client, kind)
             rows = pickers.match(listing.rows, word)
@@ -900,7 +901,7 @@ class Repl:
             # `@alert:` or `@case:` bring the list back, so narrowing and widening the filter both work.
             buf = event.current_buffer
             buf.delete_before_cursor(count=event.arg)
-            if re.search(r"@(?:alert|case):\S*$", buf.document.text_before_cursor):
+            if _PICK_WORD.search(buf.document.text_before_cursor):
                 buf.start_completion(select_first=False)
 
         STATE_DIR.mkdir(parents=True, exist_ok=True)

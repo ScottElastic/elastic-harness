@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .client import ApiError, Elastic
+from .client import DEFAULT_CASE_OWNER, ApiError, Elastic, case_owner
 from .mentions import _get
 
 KINDS = ("alert", "case")
@@ -117,7 +117,8 @@ class Picker:
         self._cache.clear()
 
     def _fetch(self, c: Elastic, kind: str) -> Listing:
-        label = "open alerts" if kind == "alert" else "open cases"
+        # say which cases these are: an empty list may only mean the other owners' cases are not listed
+        label = "open alerts" if kind == "alert" else ("open security cases" if case_owner() == DEFAULT_CASE_OWNER else "open cases")
         try:
             items = c.open_alerts(LIMIT) if kind == "alert" else c.open_cases(LIMIT)
         except ApiError as exc:

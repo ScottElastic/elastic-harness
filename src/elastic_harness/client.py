@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import urllib.error
 import urllib.request
 import uuid
@@ -15,6 +16,19 @@ from typing import Iterable, Iterator
 from .config import Profile
 
 API_VERSION = "2023-10-31"
+
+
+DEFAULT_CASE_OWNER = "securitySolution"  # the other owners are "observability" and "cases" (Stack Management)
+
+
+def case_owner() -> str:
+    """Which cases the pickers list: Security cases unless EH_CASE_OWNER says otherwise (empty means every owner)."""
+    return os.environ.get("EH_CASE_OWNER", DEFAULT_CASE_OWNER).strip()
+
+
+def _case_query(owner: str, per_page: int) -> str:
+    q = f"status=open&status=in-progress&perPage={int(per_page)}&sortField=createdAt&sortOrder=desc"
+    return q + (f"&owner={owner}" if owner else "")
 
 
 class ApiError(Exception):
@@ -158,19 +172,19 @@ class Elastic:
         return (res.get("hits") or {}).get("hits") or []
 
     def open_cases(self, limit: int = 20) -> list[dict]:
-        """The most recently created cases in this space that are not closed (open or in progress), newest first."""
-        res = self.kb("GET", f"/api/cases/_find?status=open&status=in-progress&perPage={int(limit)}"
-                             f"&sortField=createdAt&sortOrder=desc")
+        """The most recently created cases in this space that are not closed (open or in progress), newest first.
+        Security cases by default (see case_owner)."""
+        res = self.kb("GET", "/api/cases/_find?" + _case_query(case_owner(), limit))
         return [c for c in res.get("cases", []) if c.get("status") != "closed"]
 
     def count_open(self, kind: str) -> int:
-        """How many open alerts, or open and in-progress cases, this space has."""
+        """How many open alerts, or open and in-progress cases (of the owner the picker lists), this space has."""
         if kind == "alert":
             res = self.kb("POST", "/api/detection_engine/signals/search",
                           {"query": self._OPEN_ALERTS, "size": 0, "track_total_hits": True})
             total = (res.get("hits") or {}).get("total") or 0
             return int(total.get("value", 0) if isinstance(total, dict) else total)
-        return int(self.kb("GET", "/api/cases/_find?status=open&status=in-progress&perPage=1").get("total") or 0)
+        return int(self.kb("GET", "/api/cases/_find?" + _case_query(case_owner(), 1)).get("total") or 0)
 
     def case(self, case_id: str) -> dict:
         return self.kb("GET", f"/api/cases/{case_id}")

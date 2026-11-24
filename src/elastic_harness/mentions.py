@@ -14,11 +14,16 @@ from pathlib import Path
 from .client import ApiError, Elastic
 from .guard import attach_blocks, gather_files, neutralize
 
-_ELASTIC = re.compile(r"(?<![\w@/.])@(alert|case|index):([\w.\-*,:/]+[\w*])")
+_ELASTIC = re.compile(r"(?<![\w@/.])@(alerts?|cases?|index):([\w.\-*,:/]+[\w*])")  # `@cases:` is `@case:`, `@alerts:` is `@alert:`
 MAX_BLOCK = 7000
-_INCOMPLETE = re.compile(r"(?<![\w@/.])@(alert|case|index):(?![\w.\-*,:/]*[\w*])")
+_INCOMPLETE = re.compile(r"(?<![\w@/.])@(alerts?|cases?|index):(?![\w.\-*,:/]*[\w*])")
 _NEEDS = {"alert": "an alert id (type @alert: and press Tab to pick one)", "case": "a case id (type @case: and press Tab to pick one)",
           "index": "an index pattern, e.g. @index:eh-local-*"}
+
+
+def kind_of(word: str) -> str:
+    """`cases` -> `case`, `alerts` -> `alert`: the plural is typed as often as the singular."""
+    return word[:-1] if word in ("alerts", "cases") else word
 
 
 def incomplete_mentions(text: str) -> list[str]:
@@ -26,7 +31,7 @@ def incomplete_mentions(text: str) -> list[str]:
 
     A bare one was sent to the model as plain text once (it answered "your message got cut off"), so callers refuse it.
     """
-    return [f"@{k}: needs {_NEEDS[k]}" for k in dict.fromkeys(x.group(1) for x in _INCOMPLETE.finditer(text))]
+    return [f"@{k}: needs {_NEEDS[k]}" for k in dict.fromkeys(kind_of(x.group(1)) for x in _INCOMPLETE.finditer(text))]
 
 ALERT_FIRST = [
     "@timestamp", "kibana.alert.rule.name", "kibana.alert.severity", "kibana.alert.risk_score",
@@ -148,6 +153,6 @@ def gather_elastic(text: str, client: Elastic) -> tuple[str, list[str], list[dic
             notes.append({"ref": f"{kind}:{ref}", "status": f"failed: {exc.message[:90]}"})
 
     for m in _ELASTIC.finditer(text):
-        fetch(m.group(1), m.group(2))
-    text = _ELASTIC.sub(lambda m: f"{m.group(1)} {m.group(2)}", text)  # keep the sentence readable, drop the '@'
+        fetch(kind_of(m.group(1)), m.group(2))
+    text = _ELASTIC.sub(lambda m: f"{kind_of(m.group(1))} {m.group(2)}", text)  # keep the sentence readable, drop the '@'
     return text, blocks, notes

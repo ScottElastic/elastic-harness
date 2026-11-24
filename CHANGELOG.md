@@ -28,7 +28,11 @@ Notable changes. This project does not promise a stable interface yet (see the R
 - `scripts/iterm_check.py` now also types into a real prompt and reads the picker dropdowns back (19 checks).
 - CI uses `actions/checkout@v7` and `actions/setup-python@v7`, which run on Node 24 (the v4 and v5 it used declare Node 20, which GitHub is retiring).
 
+- The `@case:` picker lists **Security** cases by default (`owner=securitySolution`); `EH_CASE_OWNER` picks another owner, or all when empty.
+
 ### Fixed
+- **`@cases:` (the plural, with the colon) showed nothing.** Only `@cases` + Tab was understood. `@cases:` and `@alerts:` are now the
+  same mention as `@case:` and `@alert:` everywhere: the picker, the expansion, and the bare-mention refusal.
 - **Tab-completing `@al` did not open the `@alert:` list.** Inserting a completion does not count as typing, so the list only
   opened once you typed another character, and the stale kind row stayed on screen; pressing Enter then sent a bare `@alert:` to the
   model. Tab now carries straight on into the list, Enter inside the word takes the top row instead of sending, and a bare
